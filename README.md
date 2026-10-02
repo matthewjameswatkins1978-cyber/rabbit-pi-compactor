@@ -5,24 +5,24 @@ An adaptive policy layer around Pi's native compactor. Rabbit schedules an early
 ## Compatibility
 
 - Pi SDK: **1.0.0**
-- Pi Studio: supported through its native Pi package/resource installation and extension loader when running the Pi 1.0.0 SDK.
+- Pi Studio: loads Rabbit through its native extension loader after Pi installs it to the shared user or project package settings.
 - Does not modify Pi's `reserveTokens` or replace the native compaction engine.
 
 ## Install
 
-In Pi, install the GitHub package:
-
-```text
-/package install git:github.com/matthewjameswatkins1978-cyber/rabbit-pi-compactor
-```
-
-Or from a terminal:
+Install the GitHub package with Pi's CLI for your user account:
 
 ```powershell
 pi install git:github.com/matthewjameswatkins1978-cyber/rabbit-pi-compactor
 ```
 
-Pi Studio users can add the same Git package from its Pi package/resource settings. Rabbit uses the same Pi extension runtime and session history; it does not maintain a parallel transcript.
+For one project only:
+
+```powershell
+pi install git:github.com/matthewjameswatkins1978-cyber/rabbit-pi-compactor --local
+```
+
+Pi Studio reads those same Pi package settings. After installation, refresh or reload extensions in Studio; Rabbit appears in the Extensions list, where you can enable or disable it. Rabbit uses the same Pi extension runtime and session history and does not maintain a parallel transcript.
 
 ## Adaptive policy
 
