@@ -1,8 +1,7 @@
+export type RabbitMode = "auto" | "manual" | "off";
+
 export interface RabbitConfig {
-  readonly smallWindowBoundary: number;
-  readonly largeWindowBoundary: number;
-  readonly smallWindowTargetPercent: number;
-  readonly largeWindowTargetPercent: number;
+  /** Manual trigger percentage. Auto uses AUTO_TRIGGER_PERCENT. */
   readonly thresholdOverride: number | null;
   readonly hysteresisPercent: number;
   readonly customInstructions: string;
@@ -11,14 +10,20 @@ export interface RabbitConfig {
 export interface RabbitPolicy {
   readonly targetPercent: number;
   readonly targetTokens: number;
-  readonly band: "small" | "interpolated" | "large" | "override";
+  readonly effectiveBudget: number;
+  readonly reserveTokens: number;
+  readonly emergencyPercent: number;
+  readonly emergencyTokens: number;
+  readonly band: "auto" | "manual";
 }
 
+export const DEFAULT_OUTPUT_RESERVE_TOKENS = 16_384;
+// Initial operational targets, not claims of universally optimal values.
+export const AUTO_TRIGGER_PERCENT = 88;
+export const DEFAULT_MANUAL_TRIGGER_PERCENT = 90;
+export const EMERGENCY_GUARD_PERCENT = 96;
+
 export const DEFAULT_CONFIG: RabbitConfig = {
-  smallWindowBoundary: 131_072,
-  largeWindowBoundary: 262_144,
-  smallWindowTargetPercent: 90,
-  largeWindowTargetPercent: 35,
   thresholdOverride: null,
   hysteresisPercent: 5,
   customInstructions: "",
@@ -27,40 +32,20 @@ export const DEFAULT_CONFIG: RabbitConfig = {
 export function resolvePolicy(
   contextWindow: number | undefined,
   config: RabbitConfig = DEFAULT_CONFIG,
+  reserveTokens = DEFAULT_OUTPUT_RESERVE_TOKENS,
 ): RabbitPolicy | undefined {
-  if (!Number.isSafeInteger(contextWindow) || contextWindow! <= 0) return undefined;
-  const capacity = contextWindow!;
-  if (config.thresholdOverride !== null) {
-    return {
-      targetPercent: config.thresholdOverride,
-      targetTokens: Math.ceil((capacity * config.thresholdOverride) / 100),
-      band: "override",
-    };
-  }
-  if (capacity <= config.smallWindowBoundary) {
-    return {
-      targetPercent: config.smallWindowTargetPercent,
-      targetTokens: Math.ceil((capacity * config.smallWindowTargetPercent) / 100),
-      band: "small",
-    };
-  }
-  if (capacity >= config.largeWindowBoundary) {
-    return {
-      targetPercent: config.largeWindowTargetPercent,
-      targetTokens: Math.ceil((capacity * config.largeWindowTargetPercent) / 100),
-      band: "large",
-    };
-  }
-  const fraction =
-    (capacity - config.smallWindowBoundary) /
-    (config.largeWindowBoundary - config.smallWindowBoundary);
-  const targetPercent =
-    config.smallWindowTargetPercent +
-    fraction * (config.largeWindowTargetPercent - config.smallWindowTargetPercent);
+  if (!Number.isSafeInteger(contextWindow) || contextWindow! <= 0 || !Number.isSafeInteger(reserveTokens) || reserveTokens < 0) return undefined;
+  const effectiveBudget = contextWindow! - reserveTokens;
+  if (effectiveBudget <= 0) return undefined;
+  const targetPercent = config.thresholdOverride ?? AUTO_TRIGGER_PERCENT;
   return {
     targetPercent,
-    targetTokens: Math.ceil((capacity * targetPercent) / 100),
-    band: "interpolated",
+    targetTokens: Math.ceil((effectiveBudget * targetPercent) / 100),
+    effectiveBudget,
+    reserveTokens,
+    emergencyPercent: EMERGENCY_GUARD_PERCENT,
+    emergencyTokens: Math.ceil((effectiveBudget * EMERGENCY_GUARD_PERCENT) / 100),
+    band: config.thresholdOverride === null ? "auto" : "manual",
   };
 }
 
@@ -68,35 +53,17 @@ export function validateConfig(input: Partial<RabbitConfig>): RabbitConfig {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new Error("Rabbit configuration must be an object.");
   }
-  const config = { ...DEFAULT_CONFIG, ...input };
-  if (!Number.isSafeInteger(config.smallWindowBoundary) || config.smallWindowBoundary < 1024) {
-    throw new Error("smallWindowBoundary must be a safe integer of at least 1,024.");
+  const config: RabbitConfig = {
+    thresholdOverride: input.thresholdOverride ?? DEFAULT_CONFIG.thresholdOverride,
+    hysteresisPercent: input.hysteresisPercent ?? DEFAULT_CONFIG.hysteresisPercent,
+    customInstructions: input.customInstructions ?? DEFAULT_CONFIG.customInstructions,
+  };
+  if (config.thresholdOverride !== null &&
+    (!Number.isSafeInteger(config.thresholdOverride) || config.thresholdOverride < 1 || config.thresholdOverride > 99)) {
+    throw new Error("threshold must be a whole percentage from 1 to 99.");
   }
-  if (
-    !Number.isSafeInteger(config.largeWindowBoundary) ||
-    config.largeWindowBoundary <= config.smallWindowBoundary
-  ) {
-    throw new Error("largeWindowBoundary must exceed smallWindowBoundary.");
-  }
-  for (const [name, value] of [
-    ["smallWindowTargetPercent", config.smallWindowTargetPercent],
-    ["largeWindowTargetPercent", config.largeWindowTargetPercent],
-    ["hysteresisPercent", config.hysteresisPercent],
-  ] as const) {
-    if (!Number.isFinite(value) || value < 0 || value >= 100) {
-      throw new Error(`${name} must be between 0 and 99.`);
-    }
-  }
-  if (config.smallWindowTargetPercent <= config.largeWindowTargetPercent) {
-    throw new Error("The small-window target must exceed the large-window target.");
-  }
-  if (
-    config.thresholdOverride !== null &&
-    (!Number.isFinite(config.thresholdOverride) ||
-      config.thresholdOverride <= 0 ||
-      config.thresholdOverride >= 100)
-  ) {
-    throw new Error("threshold must be greater than 0 and less than 100.");
+  if (!Number.isFinite(config.hysteresisPercent) || config.hysteresisPercent < 0 || config.hysteresisPercent >= 100) {
+    throw new Error("hysteresisPercent must be between 0 and 99.");
   }
   if (typeof config.customInstructions !== "string" || config.customInstructions.length > 8000) {
     throw new Error("customInstructions must be a string of at most 8,000 characters.");
@@ -105,13 +72,9 @@ export function validateConfig(input: Partial<RabbitConfig>): RabbitConfig {
 }
 
 export function crossedThreshold(
-  previousPercent: number | undefined,
-  currentPercent: number,
-  thresholdPercent: number,
+  previousTokens: number | undefined,
+  currentTokens: number,
+  thresholdTokens: number,
 ): boolean {
-  return (
-    previousPercent !== undefined &&
-    previousPercent <= thresholdPercent &&
-    currentPercent > thresholdPercent
-  );
+  return previousTokens !== undefined && previousTokens <= thresholdTokens && currentTokens > thresholdTokens;
 }
