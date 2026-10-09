@@ -13,6 +13,7 @@ import { serializeConversation } from "@earendil-works/pi-coding-agent";
 function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
   const handlers = new Map();
   const commands = new Map();
+  const tools = new Map();
   const entries = [];
   const compactCalls = [];
   const statuses = new Map();
@@ -28,7 +29,7 @@ function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
     get model() { return { provider, id: modelId }; },
     getContextUsage: () => ({ tokens, contextWindow: window, percent: tokens === null ? null : (tokens / window) * 100, quotaPercent }),
     get isIdle() { return () => true; },
-    get sessionManager() { return { getSessionId: () => sessionId, getBranch: () => entries.filter((e) => e.type === "custom") }; },
+    get sessionManager() { return { getSessionId: () => sessionId, getBranch: () => entries }; },
     compact: (options) => compactCalls.push(options),
     ui: {
       setStatus: (key, value) => statuses.set(key, value),
@@ -38,6 +39,7 @@ function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
   const pi = {
     on: (event, handler) => handlers.set(event, handler),
     registerCommand: (name, command) => commands.set(name, command.handler),
+    registerTool: (tool) => tools.set(tool.name, tool),
     appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
     getSettings: () => settings,
   };
@@ -48,7 +50,7 @@ function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
   const setQuotaPercent = (next) => { quotaPercent = next; };
   const setModel = (nextProvider, nextId) => { provider = nextProvider; modelId = nextId; };
   const replaceSession = (next) => { sessionId = next; };
-  return { context, commands, compactCalls, emit, entries, replaceSession, setModel, setQuotaPercent, setSettings, setUsage, statuses };
+  return { context, commands, compactCalls, emit, entries, replaceSession, setModel, setQuotaPercent, setSettings, setUsage, statuses, tools };
 }
 
 test("Auto uses 88% of Pi's effective budget across model windows", () => {
@@ -418,4 +420,138 @@ test("Terror Bat: native Pi summary serialization truncates tool results after 2
   assert.match(serialized, new RegExp(criticalBefore));
   assert.doesNotMatch(serialized, new RegExp(criticalAfter));
   assert.match(serialized, /characters truncated/);
+});
+test("Garden deferral is agent-owned and ordinary Rabbit threshold policy stays inactive", async () => {
+  const h = harness(300_000);
+  h.emit("session_start");
+  await h.commands.get("rabbit")("mode garden", h.context);
+  const tool = h.tools.get("rabbit_garden");
+  assert.ok(tool);
+  await tool.execute("record", {
+    decision: "record",
+    unitId: "unresolved-contract",
+    summary: "Check the external API contract before changing the adapter.",
+    evidenceReferences: ["git:main@a1b2c3d:packages/adapter.ts"],
+    unresolved: ["Confirm upstream parameter semantics."],
+  }, undefined, undefined, h.context);
+  const deferred = await tool.execute("defer", {
+    decision: "defer",
+    unitId: "unresolved-contract",
+    reason: "Keep the coupled investigation intact until the API owner is checked.",
+  }, undefined, undefined, h.context);
+  assert.match(deferred.content[0].text, /deferred/i);
+  h.setUsage(Math.ceil((1_000_000 - 16_384) * 0.88) + 1);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 0, "Garden never overrides a valid DEFER with the ordinary threshold");
+  const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
+  assert.equal(state.mode, "garden");
+  assert.equal(state.gardenUnits[0].status, "deferred");
+  assert.deepEqual(state.gardenUnits[0].unresolved, ["Confirm upstream parameter semantics."]);
+  assert.equal(state.lastGardenReceipt.decision, "defer");
+});
+
+test("Garden folds through Pi compaction only at turn_end and receipts the accepted unit", async () => {
+  const h = harness(300_000);
+  h.emit("session_start");
+  await h.commands.get("rabbit")("mode garden", h.context);
+  const tool = h.tools.get("rabbit_garden");
+  await tool.execute("record", {
+    decision: "record",
+    unitId: "phase-a",
+    summary: "Finish Phase A acceptance.",
+    evidenceReferences: ["git:feature/phase-a@abc123:src/"],
+    unresolved: ["Run the focused regression."],
+  }, undefined, undefined, h.context);
+  const scheduled = await tool.execute("fold", {
+    decision: "fold",
+    unitId: "phase-a",
+    reason: "The accepted implementation is stable; retain its proof and next gate.",
+  }, undefined, undefined, h.context);
+  assert.equal(scheduled.terminate, true);
+  assert.equal(h.compactCalls.length, 0, "tool execution only schedules the operation");
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1);
+  assert.match(h.compactCalls[0].customInstructions, /phase-a/);
+  assert.match(h.compactCalls[0].customInstructions, /unresolved/);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1, "one request cannot be dispatched twice while in flight");
+  h.compactCalls[0].onComplete({ estimatedTokensAfter: 27_000 });
+  const receipt = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-garden-receipt-v1").at(-1)?.data;
+  assert.equal(receipt.decision, "fold");
+  assert.equal(receipt.status, "completed");
+  assert.equal(receipt.unitId, "phase-a");
+  assert.deepEqual(receipt.evidenceReferences, ["git:feature/phase-a@abc123:src/"]);
+  const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
+  assert.equal(state.gardenUnits[0].status, "complete");
+});
+
+
+
+test("Garden refuses duplicate requests while one compaction is queued", async () => {
+  const h = harness();
+  h.emit("session_start");
+  await h.commands.get("rabbit")("mode garden", h.context);
+  const tool = h.tools.get("rabbit_garden");
+  const request = { decision: "compact", reason: "Preserve one mission checkpoint." };
+  const first = await tool.execute("compact", request, undefined, undefined, h.context);
+  const duplicate = await tool.execute("compact", request, undefined, undefined, h.context);
+  assert.equal(first.terminate, true);
+  assert.equal(duplicate.isError, true);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1);
+});test("Garden compaction failure records a truthful failed receipt and clears the pending request", async () => {
+  const h = harness();
+  h.emit("session_start");
+  await h.commands.get("rabbit")("mode garden", h.context);
+  const tool = h.tools.get("rabbit_garden");
+  const scheduled = await tool.execute("compact", { decision: "compact", reason: "Keep the current mission state compact." }, undefined, undefined, h.context);
+  assert.equal(scheduled.terminate, true);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1);
+  h.compactCalls[0].onError(new Error("native compaction rejected"));
+  const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
+  assert.equal(state.pendingGardenRequest, undefined);
+  assert.equal(state.lastGardenReceipt.status, "failed");
+  assert.match(state.lastGardenReceipt.reason, /rejected/);
+});
+
+test("Garden in-flight compaction is recorded as interrupted after session restart", async () => {
+  const h = harness();
+  h.emit("session_start");
+  await h.commands.get("rabbit")("mode garden", h.context);
+  const tool = h.tools.get("rabbit_garden");
+  await tool.execute("compact", { decision: "compact", reason: "Preserve the active mission checkpoint." }, undefined, undefined, h.context);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1);
+  h.emit("session_shutdown");
+  h.emit("session_start");
+  const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
+  assert.equal(state.pendingGardenRequest, undefined);
+  assert.equal(state.lastGardenReceipt.status, "failed");
+  assert.match(state.lastGardenReceipt.reason, /restart/);
+  h.compactCalls[0].onComplete({ estimatedTokensAfter: 10_000 });
+  assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-receipt-v1").length, 0, "stale completion from the old session is ignored");
+});
+test("Garden restores exact Pi evidence beyond summary truncation without rewriting history", async () => {
+  const h = harness();
+  const fullEvidence = `${"x".repeat(2_500)}EXACT_SOURCE_TAIL`;
+  const sourceEntry = {
+    type: "message",
+    id: "source-evidence-1",
+    parentId: null,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    message: { role: "toolResult", content: [{ type: "text", text: fullEvidence }] },
+  };
+  h.entries.push(sourceEntry);
+  h.emit("session_start");
+  await h.commands.get("rabbit")("mode garden", h.context);
+  const tool = h.tools.get("rabbit_garden");
+  const restored = await tool.execute("restore", {
+    decision: "restore",
+    evidenceReferences: ["pi-entry:source-evidence-1"],
+  }, undefined, undefined, h.context);
+  assert.ok(restored.content[0].text.length > 2_000);
+  assert.ok(restored.content[0].text.includes(fullEvidence));
+  assert.equal(h.entries.includes(sourceEntry), true);
+  assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-garden-receipt-v1").at(-1).data.status, "restored");
 });

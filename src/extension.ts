@@ -6,7 +6,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, DEFAULT_MANUAL_TRIGGER_PERCENT, DEFAULT_OUTPUT_RESERVE_TOKENS, crossedThreshold, resolvePolicy, validateConfig } from "./policy.js";
 import type { RabbitConfig, RabbitMode } from "./policy.js";
+import { Type } from "typebox";
 import { RABBIT_COMPACTION_INSTRUCTIONS } from "./instructions.js";
+
+import { GARDEN_RECEIPT_ENTRY, MAX_GARDEN_STATE_CHARS, MAX_GARDEN_UNITS, restoreGardenEvidence, validateGardenToolInput } from "./garden.js";
+import type { GardenReceipt, GardenRequest, GardenUnit, GardenToolInput } from "./garden.js";
 
 export const STATE_ENTRY = "rabbit-pi-compactor-state-v1";
 export const RECEIPT_ENTRY = "rabbit-pi-compactor-receipt-v1";
@@ -22,6 +26,9 @@ interface PersistedState {
   readonly lastCompactionAt?: string;
   readonly lastEstimatedTokensAfter?: number | undefined;
   readonly lastError?: string | undefined;
+  readonly gardenUnits?: readonly GardenUnit[];
+  readonly pendingGardenRequest?: GardenRequest;
+  readonly lastGardenReceipt?: GardenReceipt;
 }
 
 type Usage = { readonly tokens: number; readonly contextWindow: number; readonly percent: number; readonly reserveTokens: number };
@@ -73,7 +80,7 @@ function validState(value: unknown): value is PersistedState {
   } catch {
     return false;
   }
-  return item.kind === "rabbit-state" && (item.mode === "auto" || item.mode === "manual" || item.mode === "off" || typeof item.enabled === "boolean") && typeof item.armed === "boolean";
+  return item.kind === "rabbit-state" && (item.mode === "auto" || item.mode === "manual" || item.mode === "off" || item.mode === "garden" || typeof item.enabled === "boolean") && typeof item.armed === "boolean";
 }
 
 function restore(ctx: ExtensionContext): PersistedState {
@@ -123,6 +130,7 @@ export function createRabbitExtension(): ExtensionFactory {
       let label = "🐇 waiting for context usage";
       if (state.mode === "off") label = "🐇 off";
       else if (compactionInFlight) label = "🐇 compacting…";
+      else if (state.mode === "garden") label = `🐇 garden · ${state.gardenUnits?.filter((unit) => unit.status !== "complete").length ?? 0} units`;
       else if (!currentUsage && state.lastError) label = "🐇 compact failed";
       else if (!currentUsage && state.lastCompactionAt) label = "🐇 compacted";
       else if (usage && policy) {
@@ -134,8 +142,120 @@ export function createRabbitExtension(): ExtensionFactory {
         // Status may not be available in headless Pi modes.
       }
     };
+    const gardenReceipt = (receipt: GardenReceipt) => {
+      state = { ...state, lastGardenReceipt: receipt };
+      pi.appendEntry(GARDEN_RECEIPT_ENTRY, receipt);
+      persist();
+    };
+    const gardenUnit = (unitId: string | undefined) => state.gardenUnits?.find((unit) => unit.id === unitId);
+    const gardenEvidenceFor = (request: GardenRequest) => request.unitId ? gardenUnit(request.unitId)?.evidenceReferences ?? [] : [];
+    const gardenInstructions = (request: GardenRequest) => {
+      const unit = request.unitId ? gardenUnit(request.unitId) : undefined;
+      return [
+        RABBIT_COMPACTION_INSTRUCTIONS,
+        "Garden decision: compact using Pi's native compaction path. Preserve the user's exact current intent and authority; current mission and phase; repository, branch, revision and evidence references; completed proof; unresolved questions and hypotheses; and the next gate. Keep concise receipts and references, not copied transcripts. Do not claim unresolved work is complete.",
+        `Agent decision: ${request.decision}. Reason: ${request.reason}`,
+        `Garden continuity units: ${JSON.stringify(state.gardenUnits ?? [])}`,
+        unit ? `Focus on selected unit ${unit.id}: ${unit.summary}.` : "No single unit selected; preserve all recorded mission units.",
+        state.config.customInstructions,
+      ].filter(Boolean).join("\n\n");
+    };
+    const failGardenRequest = (ctx: ExtensionContext, requestId: string, reason: string) => {
+      const request = state.pendingGardenRequest;
+      if (!request || request.requestId !== requestId) return;
+      compactionInFlight = false;
+      const receipt: GardenReceipt = {
+        version: 1,
+        decision: request.decision,
+        status: "failed",
+        ...(request.unitId ? { unitId: request.unitId } : {}),
+        evidenceReferences: gardenEvidenceFor(request),
+        reason: reason.slice(0, 512),
+        timestamp: new Date().toISOString(),
+      };
+      const { pendingGardenRequest: _pendingRequest, ...withoutPendingRequest } = state;
+      state = { ...withoutPendingRequest, lastError: reason, lastGardenReceipt: receipt, armed: false };
+      pi.appendEntry(GARDEN_RECEIPT_ENTRY, receipt);
+      persist();
+      publish(ctx);
+    };
+    const dispatchGardenRequest = (ctx: ExtensionContext): boolean => {
+      const request = state.pendingGardenRequest;
+      if (!current(ctx) || state.mode !== "garden" || !request || request.status !== "queued" || compactionInFlight) return false;
+      if (typeof ctx.compact !== "function") {
+        failGardenRequest(ctx, request.requestId, "Pi native compaction is unavailable.");
+        return true;
+      }
+      const operationGeneration = generation;
+      const operationSessionId = sessionId;
+      const inFlight: GardenRequest = { ...request, status: "in-flight" };
+      compactionInFlight = true;
+      state = { ...state, pendingGardenRequest: inFlight, lastError: undefined, armed: false };
+      const started: GardenReceipt = {
+        version: 1, decision: request.decision, status: "started",
+        ...(request.unitId ? { unitId: request.unitId } : {}),
+        evidenceReferences: gardenEvidenceFor(request), reason: request.reason, timestamp: new Date().toISOString(),
+      };
+      state = { ...state, lastGardenReceipt: started };
+      pi.appendEntry(GARDEN_RECEIPT_ENTRY, started);
+      persist();
+      publish(ctx);
+      const usage = readUsage(ctx, outputReserveTokens(pi, ctx));
+      try {
+        ctx.compact({
+          customInstructions: gardenInstructions(request),
+          onComplete: (result) => {
+            if (!active || generation !== operationGeneration || sessionId !== operationSessionId || state.pendingGardenRequest?.requestId !== request.requestId) return;
+            compactionInFlight = false;
+            const timestamp = new Date().toISOString();
+            const after = readUsage(ctx, outputReserveTokens(pi, ctx));
+            const receipt: GardenReceipt = {
+              version: 1, decision: request.decision, status: "completed",
+              ...(request.unitId ? { unitId: request.unitId } : {}),
+              evidenceReferences: gardenEvidenceFor(request),
+              ...(request.unitId ? { unresolvedCount: gardenUnit(request.unitId)?.unresolved.length ?? 0 } : {}),
+              reason: request.reason, timestamp,
+            };
+            const sequence = ctx.sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === RECEIPT_ENTRY).length + 1;
+            pi.appendEntry(RECEIPT_ENTRY, {
+              version: 1, compactionNumber: sequence, trigger: "garden", mode: "garden", reason: request.decision,
+              method: completedMethod, provider: ctx.model?.provider ?? null, model: ctx.model?.id ?? null,
+              contextWindow: usage?.contextWindow ?? null, beforeTokens: usage?.tokens ?? null, beforePercent: usage?.percent ?? null,
+              afterTokens: after?.tokens ?? null, afterPercent: after?.percent ?? null,
+              estimatedTokensAfter: result.estimatedTokensAfter ?? null, timestamp,
+            });
+            if (request.decision === "fold" && request.unitId) {
+              const units = [...(state.gardenUnits ?? [])];
+              const index = units.findIndex((unit) => unit.id === request.unitId);
+              if (index >= 0) units[index] = { ...units[index], status: "complete", updatedAt: timestamp };
+              state = { ...state, gardenUnits: units };
+            }
+            const { pendingGardenRequest: _pendingRequest, ...withoutPendingRequest } = state;
+            state = {
+              ...withoutPendingRequest, lastGardenReceipt: receipt,
+              lastCompactionAt: timestamp, lastEstimatedTokensAfter: result.estimatedTokensAfter,
+              lastError: undefined, emergencyRetryEligible: false, armed: false,
+            };
+            pi.appendEntry(GARDEN_RECEIPT_ENTRY, receipt);
+            previousValidTokens = undefined;
+            if (after) latestUsage = after;
+            persist();
+            publish(ctx);
+          },
+          onError: (error) => failGardenRequest(ctx, request.requestId, error.message),
+        });
+      } catch (error) {
+        failGardenRequest(ctx, request.requestId, error instanceof Error ? error.message : String(error));
+      }
+      return true;
+    };
     const update = (ctx: ExtensionContext) => {
       if (!current(ctx)) return;
+      if (dispatchGardenRequest(ctx)) return;
+      if (state.mode === "garden") {
+        publish(ctx);
+        return;
+      }
       const usage = readUsage(ctx, outputReserveTokens(pi, ctx));
       if (!usage) {
         // Null tokens after compaction are unknown, never zero or a trigger.
@@ -359,6 +479,7 @@ export function createRabbitExtension(): ExtensionFactory {
       sessionId = ctx.sessionManager.getSessionId();
       state = restore(ctx);
       compactionInFlight = false;
+      if (state.pendingGardenRequest?.status === "in-flight") failGardenRequest(ctx, state.pendingGardenRequest.requestId, "Garden compaction was interrupted by session restart.");
       needsPressureCheck = true;
       latestUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       previousValidTokens = latestUsage?.tokens;
@@ -370,6 +491,7 @@ export function createRabbitExtension(): ExtensionFactory {
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
       state = restore(ctx);
+      if (state.pendingGardenRequest?.status === "in-flight") failGardenRequest(ctx, state.pendingGardenRequest.requestId, "Garden compaction was interrupted by a session tree change.");
       needsPressureCheck = true;
       latestUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       previousValidTokens = latestUsage?.tokens;
@@ -415,13 +537,111 @@ export function createRabbitExtension(): ExtensionFactory {
     });
     pi.on("session_compact_failed", (event, ctx) => {
       if (!current(ctx) || !compactionInFlight) return;
+      if (state.pendingGardenRequest?.status === "in-flight") {
+        failGardenRequest(ctx, state.pendingGardenRequest.requestId, event.errorMessage ?? "Pi compaction failed.");
+        return;
+      }
       compactionInFlight = false;
       state = { ...state, armed: false, lastError: event.errorMessage ?? "Pi compaction failed." };
       persist();
       publish(ctx);
     });
+    pi.registerTool({
+      name: "rabbit_garden",
+      label: "Rabbit Garden",
+      description: "Agent-led context management for the active Pi session. Record or update a continuity unit, defer compaction, fold a completed unit through Pi native compaction, compact the active mission, or restore exact evidence from Pi session entries. Garden mode disables Rabbit's ordinary threshold trigger while keeping Pi's own overflow safety enabled.",
+      promptSnippet: "Use Rabbit Garden to decide what context to defer, fold, compact, or restore.",
+      promptGuidelines: [
+        "Use Garden decisions only when the mission state supports them; DEFER when work is unresolved or evidence is insufficient.",
+        "Record concise evidence references and unresolved questions; do not copy transcripts or claim unverified work is complete.",
+        "Use restore with exact pi-entry:<entryId> references when source evidence is needed.",
+      ],
+      parameters: Type.Object({
+        decision: Type.Union([Type.Literal("status"), Type.Literal("record"), Type.Literal("defer"), Type.Literal("fold"), Type.Literal("compact"), Type.Literal("restore")]),
+        unitId: Type.Optional(Type.String({ maxLength: 128 })),
+        summary: Type.Optional(Type.String({ maxLength: 512 })),
+        status: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("deferred"), Type.Literal("complete")])),
+        evidenceReferences: Type.Optional(Type.Array(Type.String({ maxLength: 512 }), { maxItems: 24 })),
+        unresolved: Type.Optional(Type.Array(Type.String({ maxLength: 512 }), { maxItems: 24 })),
+        reason: Type.Optional(Type.String({ maxLength: 512 })),
+      }),      executionMode: "sequential",
+      execute: async (_toolCallId, rawInput, _signal, _onUpdate, ctx) => {
+        try {
+          const input: GardenToolInput = validateGardenToolInput(rawInput);
+          if (input.decision !== "status" && state.mode !== "garden") {
+            throw new Error("Set Rabbit mode to garden with /rabbit mode garden before making Garden decisions.");
+          }
+          if (input.decision === "status") {
+            const units = state.gardenUnits ?? [];
+            const usage = readUsage(ctx, outputReserveTokens(pi, ctx));
+            return { details: undefined, content: [{ type: "text", text: JSON.stringify({ mode: state.mode, contextPercent: usage?.percent ?? null, units, pending: state.pendingGardenRequest ?? null, lastDecision: state.lastGardenReceipt ?? null }, null, 2) }] };
+          }
+          if (state.pendingGardenRequest || compactionInFlight) throw new Error("Finish or restart the pending Garden compaction before making another Garden decision.");
+          if (input.decision === "restore") {
+            const evidence = restoreGardenEvidence(ctx.sessionManager.getBranch(), input.evidenceReferences ?? []);
+            const receipt: GardenReceipt = { version: 1, decision: "restore", status: "restored", ...(input.evidenceReferences ? { evidenceReferences: input.evidenceReferences } : {}), timestamp: new Date().toISOString() };
+            gardenReceipt(receipt);
+            return { details: undefined, content: [{ type: "text", text: evidence }] };
+          }
+          if (input.decision === "record") {
+            const units = [...(state.gardenUnits ?? [])];
+            const index = units.findIndex((unit) => unit.id === input.unitId);
+            if (index < 0 && units.length >= MAX_GARDEN_UNITS) throw new Error(`Garden stores at most ${MAX_GARDEN_UNITS} continuity units per session.`);
+            const previous = index < 0 ? undefined : units[index];
+            const unit: GardenUnit = {
+              id: input.unitId!,
+              summary: input.summary!,
+              status: input.status ?? previous?.status ?? "active",
+              evidenceReferences: input.evidenceReferences ?? previous?.evidenceReferences ?? [],
+              unresolved: input.unresolved ?? previous?.unresolved ?? [],
+              updatedAt: new Date().toISOString(),
+            };
+            if (index < 0) units.push(unit); else units[index] = unit;
+            if (JSON.stringify(units).length > MAX_GARDEN_STATE_CHARS) throw new Error(`Garden continuity state exceeds ${MAX_GARDEN_STATE_CHARS} characters.`);
+            state = { ...state, gardenUnits: units };
+            const receipt: GardenReceipt = { version: 1, decision: "record", status: "recorded", unitId: unit.id, evidenceReferences: unit.evidenceReferences, unresolvedCount: unit.unresolved.length, timestamp: unit.updatedAt };
+            gardenReceipt(receipt);
+            return { details: undefined, content: [{ type: "text", text: `Recorded Garden unit ${unit.id} with ${unit.unresolved.length} unresolved item(s).` }] };
+          }
+          const unit = input.unitId ? gardenUnit(input.unitId) : undefined;
+          if ((input.decision === "defer" || input.decision === "fold") && !unit) throw new Error(`Garden unit ${JSON.stringify(input.unitId)} was not found; record it before ${input.decision}.`);
+          if (input.decision === "defer" || input.decision === "fold") {
+            const units = [...(state.gardenUnits ?? [])];
+            const index = units.findIndex((item) => item.id === input.unitId);
+            const updated: GardenUnit = { ...unit!, status: input.decision === "defer" ? "deferred" : "active", updatedAt: new Date().toISOString() };
+            units[index] = updated;
+            state = { ...state, gardenUnits: units };
+          }
+          if (input.decision === "defer") {
+            const receipt: GardenReceipt = { version: 1, decision: "defer", status: "deferred", unitId: unit!.id, evidenceReferences: unit!.evidenceReferences, unresolvedCount: unit!.unresolved.length, ...(input.reason ? { reason: input.reason } : {}), timestamp: new Date().toISOString() };
+            gardenReceipt(receipt);
+            return { details: undefined, content: [{ type: "text", text: `Deferred ${unit!.id}; its unresolved state and evidence references remain available.` }] };
+          }
+
+          const request: GardenRequest = {
+            requestId: `garden-${Date.now()}-${generation}`,
+            decision: input.decision as "fold" | "compact",
+            ...(input.unitId ? { unitId: input.unitId } : {}),
+            reason: input.reason!,
+            requestedAt: new Date().toISOString(),
+            status: "queued",
+          };
+          state = { ...state, pendingGardenRequest: request };
+          const receipt: GardenReceipt = {
+            version: 1, decision: request.decision, status: "scheduled",
+            ...(request.unitId ? { unitId: request.unitId } : {}),
+            evidenceReferences: gardenEvidenceFor(request), reason: request.reason, timestamp: request.requestedAt,
+          };
+          gardenReceipt(receipt);
+          publish(ctx);
+          return { details: undefined, content: [{ type: "text", text: `Garden ${request.decision} queued for the next Pi turn_end boundary.` }], terminate: true };
+        } catch (error) {
+          return { details: undefined, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true };
+        }
+      },
+    });
     pi.registerCommand("rabbit", {
-      description: "Inspect and configure Rabbit Pi Compactor",
+      description: "Inspect and configure Rabbit Pi Compactor and Garden mode",
       handler: async (args, ctx) => {
         context = ctx;
         const [requestedOperation, value] = args.trim().split(/\s+/, 2);
@@ -439,10 +659,11 @@ export function createRabbitExtension(): ExtensionFactory {
             `mode: ${state.mode}`,
             `model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown"}`,
             `context: ${currentUsage && policy ? `${currentUsage.tokens.toLocaleString()} / ${policy.effectiveBudget.toLocaleString()} effective (${currentUsage.percent.toFixed(1)}%); window ${currentUsage.contextWindow.toLocaleString()}, output reserve ${policy.reserveTokens.toLocaleString()}` : usage ? `unknown; last observed ${usage.percent.toFixed(1)}% effective` : "unknown"}`,
-            `trigger: ${policy ? `${policy.targetPercent.toFixed(1)}% (${policy.band})` : "waiting for context usage"}`,
-            `emergency guard: ${policy ? `${policy.emergencyPercent}%` : "unavailable"}`,
-            `state: ${compactionInFlight ? "compacting" : state.armed ? "armed" : "hysteresis"}`,
+            `trigger: ${state.mode === "garden" ? "agent-directed (Pi overflow safety active)" : policy ? `${policy.targetPercent.toFixed(1)}% (${policy.band})` : "waiting for context usage"}`,
+            `emergency guard: ${state.mode === "garden" ? "Pi native overflow safety" : policy ? `${policy.emergencyPercent}%` : "unavailable"}`,
+            `state: ${compactionInFlight ? "compacting" : state.mode === "garden" ? "awaiting agent decision" : state.armed ? "armed" : "hysteresis"}`,
             `compactions: ${ctx.sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === RECEIPT_ENTRY).length}`,
+            `garden units: ${state.gardenUnits?.length ?? 0}; pending: ${state.pendingGardenRequest?.decision ?? "none"}`,
             `method: ${lastReceipt?.type === "custom" ? (lastReceipt.data as { method?: string }).method ?? "unknown" : "unknown"}`,
             `last compact: ${state.lastCompactionAt ?? "never"}`,
             ...(state.lastEstimatedTokensAfter !== undefined ? [`Pi estimated after: ${state.lastEstimatedTokensAfter.toLocaleString()} tokens`] : []),
@@ -463,8 +684,8 @@ export function createRabbitExtension(): ExtensionFactory {
           return;
         }
         if (operation === "mode") {
-          if (value !== "auto" && value !== "manual" && value !== "off") {
-            ctx.ui.notify("Usage: /rabbit mode auto|manual|off", "warning");
+          if (value !== "auto" && value !== "manual" && value !== "off" && value !== "garden") {
+            ctx.ui.notify("Usage: /rabbit mode auto|manual|off|garden", "warning");
             return;
           }
           state = {
@@ -499,7 +720,7 @@ export function createRabbitExtension(): ExtensionFactory {
           }
           return;
         }
-        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|on|off|compact|threshold <1-99|adaptive>", "warning");
+        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|on|off|compact|threshold <1-99|adaptive>", "warning");
       },
     });
   };
