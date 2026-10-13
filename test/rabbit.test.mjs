@@ -455,12 +455,15 @@ test("Garden folds through Pi compaction only at turn_end and receipts the accep
   h.emit("session_start");
   await h.commands.get("rabbit")("mode garden", h.context);
   const tool = h.tools.get("rabbit_garden");
+  // FOLD requires a unit already explicitly accepted as complete with no
+  // unresolved obligations; folding context never manufactures completion.
   await tool.execute("record", {
     decision: "record",
     unitId: "phase-a",
-    summary: "Finish Phase A acceptance.",
+    summary: "Phase A acceptance is complete; proof retained.",
+    status: "complete",
     evidenceReferences: ["git:feature/phase-a@abc123:src/"],
-    unresolved: ["Run the focused regression."],
+    unresolved: [],
   }, undefined, undefined, h.context);
   const scheduled = await tool.execute("fold", {
     decision: "fold",
@@ -481,8 +484,11 @@ test("Garden folds through Pi compaction only at turn_end and receipts the accep
   assert.equal(receipt.status, "completed");
   assert.equal(receipt.unitId, "phase-a");
   assert.deepEqual(receipt.evidenceReferences, ["git:feature/phase-a@abc123:src/"]);
+  assert.deepEqual(receipt.unverifiedEvidenceReferences, ["git:feature/phase-a@abc123:src/"]);
+  assert.deepEqual(receipt.verifiedEvidenceReferences, []);
   const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
   assert.equal(state.gardenUnits[0].status, "complete");
+  assert.deepEqual(state.gardenUnits[0].unresolved, []);
 });
 
 
@@ -527,7 +533,7 @@ test("Garden in-flight compaction is recorded as interrupted after session resta
   h.emit("session_start");
   const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
   assert.equal(state.pendingGardenRequest, undefined);
-  assert.equal(state.lastGardenReceipt.status, "failed");
+  assert.equal(state.lastGardenReceipt.status, "interrupted");
   assert.match(state.lastGardenReceipt.reason, /restart/);
   h.compactCalls[0].onComplete({ estimatedTokensAfter: 10_000 });
   assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-receipt-v1").length, 0, "stale completion from the old session is ignored");

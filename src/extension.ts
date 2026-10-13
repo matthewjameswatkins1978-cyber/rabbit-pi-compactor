@@ -9,7 +9,7 @@ import type { RabbitConfig, RabbitMode } from "./policy.js";
 import { Type } from "typebox";
 import { RABBIT_COMPACTION_INSTRUCTIONS } from "./instructions.js";
 
-import { GARDEN_RECEIPT_ENTRY, MAX_GARDEN_STATE_CHARS, MAX_GARDEN_UNITS, restoreGardenEvidence, validateGardenToolInput } from "./garden.js";
+import { GARDEN_RECEIPT_ENTRY, MAX_GARDEN_STATE_CHARS, MAX_GARDEN_UNITS, restoreGardenEvidence, splitEvidenceReferences, validateEvidenceReferences, validateGardenToolInput } from "./garden.js";
 import type { GardenReceipt, GardenRequest, GardenUnit, GardenToolInput } from "./garden.js";
 
 export const STATE_ENTRY = "rabbit-pi-compactor-state-v1";
@@ -113,6 +113,10 @@ export function createRabbitExtension(): ExtensionFactory {
     let latestUsage: Usage | undefined;
     let completedMethod = "unknown";
     let compactionInFlight = false;
+    let gardenRequestCounter = 0;
+    // Terminal Garden request ids already receipted in this process. Guards
+    // duplicate session_compact_failed / onError / lifecycle notifications.
+    const settledGardenRequests = new Set<string>();
 
     const current = (ctx: ExtensionContext): boolean => {
       try {
@@ -160,16 +164,28 @@ export function createRabbitExtension(): ExtensionFactory {
         state.config.customInstructions,
       ].filter(Boolean).join("\n\n");
     };
+    const gardenEvidenceSplit = (ctx: ExtensionContext, request: GardenRequest) => {
+      try {
+        return splitEvidenceReferences(ctx.sessionManager.getBranch(), gardenEvidenceFor(request));
+      } catch {
+        return { verified: [] as string[], unverified: [...gardenEvidenceFor(request)] };
+      }
+    };
     const failGardenRequest = (ctx: ExtensionContext, requestId: string, reason: string) => {
       const request = state.pendingGardenRequest;
-      if (!request || request.requestId !== requestId) return;
+      if (!request || request.requestId !== requestId || settledGardenRequests.has(requestId)) return;
+      settledGardenRequests.add(requestId);
       compactionInFlight = false;
+      const split = gardenEvidenceSplit(ctx, request);
       const receipt: GardenReceipt = {
         version: 1,
         decision: request.decision,
         status: "failed",
+        requestId: request.requestId,
         ...(request.unitId ? { unitId: request.unitId } : {}),
         evidenceReferences: gardenEvidenceFor(request),
+        verifiedEvidenceReferences: split.verified,
+        unverifiedEvidenceReferences: split.unverified,
         reason: reason.slice(0, 512),
         timestamp: new Date().toISOString(),
       };
@@ -178,6 +194,39 @@ export function createRabbitExtension(): ExtensionFactory {
       pi.appendEntry(GARDEN_RECEIPT_ENTRY, receipt);
       persist();
       publish(ctx);
+    };
+    const settleQueuedGardenRequest = (ctx: ExtensionContext, status: "cancelled" | "interrupted", reason: string): boolean => {
+      const request = state.pendingGardenRequest;
+      if (!request || settledGardenRequests.has(request.requestId)) return false;
+      settledGardenRequests.add(request.requestId);
+      compactionInFlight = false;
+      const split = gardenEvidenceSplit(ctx, request);
+      const receipt: GardenReceipt = {
+        version: 1,
+        decision: request.decision,
+        status,
+        requestId: request.requestId,
+        ...(request.unitId ? { unitId: request.unitId } : {}),
+        evidenceReferences: gardenEvidenceFor(request),
+        verifiedEvidenceReferences: split.verified,
+        unverifiedEvidenceReferences: split.unverified,
+        reason: reason.slice(0, 512),
+        timestamp: new Date().toISOString(),
+      };
+      const { pendingGardenRequest: _pendingRequest, ...withoutPendingRequest } = state;
+      state = { ...withoutPendingRequest, lastGardenReceipt: receipt };
+      pi.appendEntry(GARDEN_RECEIPT_ENTRY, receipt);
+      persist();
+      publish(ctx);
+      return true;
+    };
+    const invalidatePendingGardenRequest = (ctx: ExtensionContext, reason: string): boolean => {
+      const request = state.pendingGardenRequest;
+      if (!request) return false;
+      if (request.status === "in-flight") {
+        return settleQueuedGardenRequest(ctx, "interrupted", reason);
+      }
+      return settleQueuedGardenRequest(ctx, "cancelled", reason);
     };
     const dispatchGardenRequest = (ctx: ExtensionContext): boolean => {
       const request = state.pendingGardenRequest;
@@ -193,6 +242,7 @@ export function createRabbitExtension(): ExtensionFactory {
       state = { ...state, pendingGardenRequest: inFlight, lastError: undefined, armed: false };
       const started: GardenReceipt = {
         version: 1, decision: request.decision, status: "started",
+        requestId: request.requestId,
         ...(request.unitId ? { unitId: request.unitId } : {}),
         evidenceReferences: gardenEvidenceFor(request), reason: request.reason, timestamp: new Date().toISOString(),
       };
@@ -205,14 +255,22 @@ export function createRabbitExtension(): ExtensionFactory {
         ctx.compact({
           customInstructions: gardenInstructions(request),
           onComplete: (result) => {
-            if (!active || generation !== operationGeneration || sessionId !== operationSessionId || state.pendingGardenRequest?.requestId !== request.requestId) return;
+            if (!active || generation !== operationGeneration || sessionId !== operationSessionId || state.pendingGardenRequest?.requestId !== request.requestId || settledGardenRequests.has(request.requestId)) return;
+            settledGardenRequests.add(request.requestId);
             compactionInFlight = false;
             const timestamp = new Date().toISOString();
             const after = readUsage(ctx, outputReserveTokens(pi, ctx));
+            const split = gardenEvidenceSplit(ctx, request);
+            // A completed fold receipt records successful native *context compaction*,
+            // never acceptance of the engineering deliverable. Unit completion status
+            // is owned exclusively by explicit record decisions (see tool handler).
             const receipt: GardenReceipt = {
               version: 1, decision: request.decision, status: "completed",
+              requestId: request.requestId,
               ...(request.unitId ? { unitId: request.unitId } : {}),
               evidenceReferences: gardenEvidenceFor(request),
+              verifiedEvidenceReferences: split.verified,
+              unverifiedEvidenceReferences: split.unverified,
               ...(request.unitId ? { unresolvedCount: gardenUnit(request.unitId)?.unresolved.length ?? 0 } : {}),
               reason: request.reason, timestamp,
             };
@@ -224,12 +282,7 @@ export function createRabbitExtension(): ExtensionFactory {
               afterTokens: after?.tokens ?? null, afterPercent: after?.percent ?? null,
               estimatedTokensAfter: result.estimatedTokensAfter ?? null, timestamp,
             });
-            if (request.decision === "fold" && request.unitId) {
-              const units = [...(state.gardenUnits ?? [])];
-              const index = units.findIndex((unit) => unit.id === request.unitId);
-              if (index >= 0) units[index] = { ...units[index], status: "complete", updatedAt: timestamp };
-              state = { ...state, gardenUnits: units };
-            }
+            // Native compaction never marks a task complete; FOLD requires a pre-completed unit.
             const { pendingGardenRequest: _pendingRequest, ...withoutPendingRequest } = state;
             state = {
               ...withoutPendingRequest, lastGardenReceipt: receipt,
@@ -479,7 +532,11 @@ export function createRabbitExtension(): ExtensionFactory {
       sessionId = ctx.sessionManager.getSessionId();
       state = restore(ctx);
       compactionInFlight = false;
-      if (state.pendingGardenRequest?.status === "in-flight") failGardenRequest(ctx, state.pendingGardenRequest.requestId, "Garden compaction was interrupted by session restart.");
+      // Queued requests never survive a restart: they lacked fresh authorization.
+      // In-flight requests receive an interruption receipt; queued ones a cancellation.
+      if (state.pendingGardenRequest) invalidatePendingGardenRequest(ctx, state.pendingGardenRequest.status === "in-flight"
+        ? "Garden compaction was interrupted by session restart."
+        : "Queued Garden request was cancelled by session restart; request fresh authorization.");
       needsPressureCheck = true;
       latestUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       previousValidTokens = latestUsage?.tokens;
@@ -491,7 +548,9 @@ export function createRabbitExtension(): ExtensionFactory {
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
       state = restore(ctx);
-      if (state.pendingGardenRequest?.status === "in-flight") failGardenRequest(ctx, state.pendingGardenRequest.requestId, "Garden compaction was interrupted by a session tree change.");
+      if (state.pendingGardenRequest) invalidatePendingGardenRequest(ctx, state.pendingGardenRequest.status === "in-flight"
+        ? "Garden compaction was interrupted by a session tree change."
+        : "Queued Garden request was cancelled by a session tree change; request fresh authorization.");
       needsPressureCheck = true;
       latestUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       previousValidTokens = latestUsage?.tokens;
@@ -554,6 +613,8 @@ export function createRabbitExtension(): ExtensionFactory {
       promptGuidelines: [
         "Use Garden decisions only when the mission state supports them; DEFER when work is unresolved or evidence is insufficient.",
         "Record concise evidence references and unresolved questions; do not copy transcripts or claim unverified work is complete.",
+        "External git:/file:/build: references are unverified pointers, never verified proof; only pi-entry:<entryId> handles confirmed on the active branch count as verified evidence.",
+        "FOLD only compacts context for a unit already recorded as complete with no unresolved obligations; it never marks work complete.",
         "Use restore with exact pi-entry:<entryId> references when source evidence is needed.",
       ],
       parameters: Type.Object({
@@ -572,14 +633,19 @@ export function createRabbitExtension(): ExtensionFactory {
             throw new Error("Set Rabbit mode to garden with /rabbit mode garden before making Garden decisions.");
           }
           if (input.decision === "status") {
-            const units = state.gardenUnits ?? [];
+            const branch = ctx.sessionManager.getBranch();
+            const units = (state.gardenUnits ?? []).map((unit) => {
+              const split = splitEvidenceReferences(branch, unit.evidenceReferences);
+              return { ...unit, verifiedEvidenceReferences: split.verified, unverifiedEvidenceReferences: split.unverified };
+            });
             const usage = readUsage(ctx, outputReserveTokens(pi, ctx));
-            return { details: undefined, content: [{ type: "text", text: JSON.stringify({ mode: state.mode, contextPercent: usage?.percent ?? null, units, pending: state.pendingGardenRequest ?? null, lastDecision: state.lastGardenReceipt ?? null }, null, 2) }] };
+            return { details: undefined, content: [{ type: "text", text: JSON.stringify({ mode: state.mode, contextPercent: usage?.percent ?? null, units, pending: state.pendingGardenRequest ?? null, lastDecision: state.lastGardenReceipt ?? null, evidenceNote: "verifiedEvidenceReferences are pi-entry handles confirmed on the active branch; unverifiedEvidenceReferences are external pointers/claims." }, null, 2) }] };
           }
           if (state.pendingGardenRequest || compactionInFlight) throw new Error("Finish or restart the pending Garden compaction before making another Garden decision.");
           if (input.decision === "restore") {
             const evidence = restoreGardenEvidence(ctx.sessionManager.getBranch(), input.evidenceReferences ?? []);
-            const receipt: GardenReceipt = { version: 1, decision: "restore", status: "restored", ...(input.evidenceReferences ? { evidenceReferences: input.evidenceReferences } : {}), timestamp: new Date().toISOString() };
+            const split = splitEvidenceReferences(ctx.sessionManager.getBranch(), input.evidenceReferences ?? []);
+            const receipt: GardenReceipt = { version: 1, decision: "restore", status: "restored", ...(input.evidenceReferences ? { evidenceReferences: input.evidenceReferences } : {}), verifiedEvidenceReferences: split.verified, unverifiedEvidenceReferences: split.unverified, timestamp: new Date().toISOString() };
             gardenReceipt(receipt);
             return { details: undefined, content: [{ type: "text", text: evidence }] };
           }
@@ -588,38 +654,50 @@ export function createRabbitExtension(): ExtensionFactory {
             const index = units.findIndex((unit) => unit.id === input.unitId);
             if (index < 0 && units.length >= MAX_GARDEN_UNITS) throw new Error(`Garden stores at most ${MAX_GARDEN_UNITS} continuity units per session.`);
             const previous = index < 0 ? undefined : units[index];
+            const effectiveStatus = input.status ?? previous?.status ?? "active";
+            const effectiveUnresolved = input.unresolved ?? previous?.unresolved ?? [];
+            if (effectiveStatus === "complete" && effectiveUnresolved.length > 0) {
+              throw new Error(`Cannot record unit ${JSON.stringify(input.unitId)} as complete while ${effectiveUnresolved.length} unresolved obligation(s) remain; resolve them or record as active/deferred.`);
+            }
+            const effectiveReferences = input.evidenceReferences ?? previous?.evidenceReferences ?? [];
+            const split = validateEvidenceReferences(ctx.sessionManager.getBranch(), effectiveReferences);
             const unit: GardenUnit = {
               id: input.unitId!,
               summary: input.summary!,
-              status: input.status ?? previous?.status ?? "active",
-              evidenceReferences: input.evidenceReferences ?? previous?.evidenceReferences ?? [],
-              unresolved: input.unresolved ?? previous?.unresolved ?? [],
+              status: effectiveStatus,
+              evidenceReferences: effectiveReferences,
+              unresolved: [...effectiveUnresolved],
               updatedAt: new Date().toISOString(),
             };
             if (index < 0) units.push(unit); else units[index] = unit;
             if (JSON.stringify(units).length > MAX_GARDEN_STATE_CHARS) throw new Error(`Garden continuity state exceeds ${MAX_GARDEN_STATE_CHARS} characters.`);
             state = { ...state, gardenUnits: units };
-            const receipt: GardenReceipt = { version: 1, decision: "record", status: "recorded", unitId: unit.id, evidenceReferences: unit.evidenceReferences, unresolvedCount: unit.unresolved.length, timestamp: unit.updatedAt };
+            const receipt: GardenReceipt = { version: 1, decision: "record", status: "recorded", unitId: unit.id, evidenceReferences: unit.evidenceReferences, verifiedEvidenceReferences: split.verified, unverifiedEvidenceReferences: split.unverified, unresolvedCount: unit.unresolved.length, timestamp: unit.updatedAt };
             gardenReceipt(receipt);
-            return { details: undefined, content: [{ type: "text", text: `Recorded Garden unit ${unit.id} with ${unit.unresolved.length} unresolved item(s).` }] };
+            return { details: undefined, content: [{ type: "text", text: `Recorded Garden unit ${unit.id} with ${unit.unresolved.length} unresolved item(s); ${split.verified.length} verified native, ${split.unverified.length} unverified pointer(s).` }] };
           }
           const unit = input.unitId ? gardenUnit(input.unitId) : undefined;
           if ((input.decision === "defer" || input.decision === "fold") && !unit) throw new Error(`Garden unit ${JSON.stringify(input.unitId)} was not found; record it before ${input.decision}.`);
-          if (input.decision === "defer" || input.decision === "fold") {
+          if (input.decision === "fold") {
+            if (unit!.status !== "complete") throw new Error(`Fold requires unit ${JSON.stringify(unit!.id)} to be explicitly recorded as complete first; current status is ${JSON.stringify(unit!.status)}. Folding context never marks work complete.`);
+            if (unit!.unresolved.length > 0) throw new Error(`Fold requires unit ${JSON.stringify(unit!.id)} to have no unresolved obligations; ${unit!.unresolved.length} remain. Resolve them or defer instead.`);
+          }
+          if (input.decision === "defer") {
             const units = [...(state.gardenUnits ?? [])];
             const index = units.findIndex((item) => item.id === input.unitId);
-            const updated: GardenUnit = { ...unit!, status: input.decision === "defer" ? "deferred" : "active", updatedAt: new Date().toISOString() };
+            const updated: GardenUnit = { ...unit!, status: "deferred", updatedAt: new Date().toISOString() };
             units[index] = updated;
             state = { ...state, gardenUnits: units };
           }
           if (input.decision === "defer") {
-            const receipt: GardenReceipt = { version: 1, decision: "defer", status: "deferred", unitId: unit!.id, evidenceReferences: unit!.evidenceReferences, unresolvedCount: unit!.unresolved.length, ...(input.reason ? { reason: input.reason } : {}), timestamp: new Date().toISOString() };
+            const split = splitEvidenceReferences(ctx.sessionManager.getBranch(), unit!.evidenceReferences);
+            const receipt: GardenReceipt = { version: 1, decision: "defer", status: "deferred", unitId: unit!.id, evidenceReferences: unit!.evidenceReferences, verifiedEvidenceReferences: split.verified, unverifiedEvidenceReferences: split.unverified, unresolvedCount: unit!.unresolved.length, ...(input.reason ? { reason: input.reason } : {}), timestamp: new Date().toISOString() };
             gardenReceipt(receipt);
             return { details: undefined, content: [{ type: "text", text: `Deferred ${unit!.id}; its unresolved state and evidence references remain available.` }] };
           }
 
           const request: GardenRequest = {
-            requestId: `garden-${Date.now()}-${generation}`,
+            requestId: `garden-${Date.now()}-${generation}-${(gardenRequestCounter += 1)}`,
             decision: input.decision as "fold" | "compact",
             ...(input.unitId ? { unitId: input.unitId } : {}),
             reason: input.reason!,
@@ -627,10 +705,15 @@ export function createRabbitExtension(): ExtensionFactory {
             status: "queued",
           };
           state = { ...state, pendingGardenRequest: request };
+          const scheduleSplit = splitEvidenceReferences(ctx.sessionManager.getBranch(), gardenEvidenceFor(request));
           const receipt: GardenReceipt = {
             version: 1, decision: request.decision, status: "scheduled",
+            requestId: request.requestId,
             ...(request.unitId ? { unitId: request.unitId } : {}),
-            evidenceReferences: gardenEvidenceFor(request), reason: request.reason, timestamp: request.requestedAt,
+            evidenceReferences: gardenEvidenceFor(request),
+            verifiedEvidenceReferences: scheduleSplit.verified,
+            unverifiedEvidenceReferences: scheduleSplit.unverified,
+            reason: request.reason, timestamp: request.requestedAt,
           };
           gardenReceipt(receipt);
           publish(ctx);
@@ -672,11 +755,33 @@ export function createRabbitExtension(): ExtensionFactory {
           return;
         }
         if (operation === "on" || operation === "off") {
+          const leavingGarden = state.mode === "garden";
           state = { ...state, mode: operation === "off" ? "off" : state.config.thresholdOverride === null ? "auto" : "manual" };
+          if (leavingGarden && state.pendingGardenRequest) {
+            generation += 1;
+            invalidatePendingGardenRequest(ctx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
+          }
           needsPressureCheck = operation === "on";
           persist();
           publish(ctx);
           ctx.ui.notify(`Rabbit ${operation}.`, "info");
+          return;
+        }
+        if (operation === "cancel") {
+          const pending = state.pendingGardenRequest;
+          if (!pending) {
+            ctx.ui.notify("No queued Garden request to cancel.", "info");
+            return;
+          }
+          if (pending.status !== "queued") {
+            ctx.ui.notify("Garden compaction has already started; cancellation is only available before turn_end dispatch.", "warning");
+            return;
+          }
+          generation += 1;
+          settleQueuedGardenRequest(ctx, "cancelled", "Queued Garden request was cancelled by /rabbit cancel before execution.");
+          persist();
+          publish(ctx);
+          ctx.ui.notify("Queued Garden request cancelled.", "info");
           return;
         }
         if (operation === "compact") {
@@ -688,6 +793,7 @@ export function createRabbitExtension(): ExtensionFactory {
             ctx.ui.notify("Usage: /rabbit mode auto|manual|off|garden", "warning");
             return;
           }
+          const leavingGarden = state.mode === "garden" && value !== "garden";
           state = {
             ...state,
             mode: value as RabbitMode,
@@ -697,6 +803,12 @@ export function createRabbitExtension(): ExtensionFactory {
                 ? validateConfig({ ...state.config, thresholdOverride: DEFAULT_MANUAL_TRIGGER_PERCENT })
                 : state.config,
           };
+          if (leavingGarden && state.pendingGardenRequest) {
+            // Bump generation so any late callback for the abandoned request can
+            // never mutate the new mode/session; the request itself is receipted.
+            generation += 1;
+            invalidatePendingGardenRequest(ctx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
+          }
           needsPressureCheck = value !== "off";
           persist();
           publish(ctx);
@@ -720,7 +832,7 @@ export function createRabbitExtension(): ExtensionFactory {
           }
           return;
         }
-        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|on|off|compact|threshold <1-99|adaptive>", "warning");
+        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|on|off|compact|cancel|threshold <1-99|adaptive>", "warning");
       },
     });
   };

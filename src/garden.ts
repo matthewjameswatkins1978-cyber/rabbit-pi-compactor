@@ -30,9 +30,14 @@ export interface GardenRequest {
 export interface GardenReceipt {
   readonly version: 1;
   readonly decision: GardenDecision;
-  readonly status: "recorded" | "deferred" | "scheduled" | "started" | "completed" | "failed" | "restored";
+  readonly status: "recorded" | "deferred" | "scheduled" | "started" | "completed" | "failed" | "restored" | "cancelled" | "interrupted";
+  readonly requestId?: string;
   readonly unitId?: string;
   readonly evidenceReferences?: readonly string[];
+  /** Native pi-entry handles confirmed on the active branch at receipt time. */
+  readonly verifiedEvidenceReferences?: readonly string[];
+  /** External pointers (git:, file:, build:, etc.) retained as claims, never verified proof. */
+  readonly unverifiedEvidenceReferences?: readonly string[];
   readonly unresolvedCount?: number;
   readonly reason?: string;
   readonly timestamp: string;
@@ -125,4 +130,46 @@ export function restoreGardenEvidence(
     throw new Error(`Restore output exceeds ${MAX_RESTORED_EVIDENCE_CHARS} characters; request fewer evidence references. Source history is unchanged.`);
   }
   return output;
+}
+
+export function isPiEntryReference(reference: string): boolean {
+  return reference.startsWith("pi-entry:");
+}
+
+export function splitEvidenceReferences(
+  branch: readonly SessionEntry[],
+  references: readonly string[],
+): { verified: string[]; unverified: string[] } {
+  const ids = new Set(branch.map((entry) => entry.id));
+  const verified: string[] = [];
+  const unverified: string[] = [];
+  for (const reference of references) {
+    if (isPiEntryReference(reference)) {
+      const entryId = reference.slice("pi-entry:".length);
+      if (entryId.length > 0 && ids.has(entryId)) verified.push(reference);
+      else unverified.push(reference);
+    } else {
+      unverified.push(reference);
+    }
+  }
+  return { verified, unverified };
+}
+
+export function validateEvidenceReferences(
+  branch: readonly SessionEntry[],
+  references: readonly string[],
+): { verified: string[]; unverified: string[] } {
+  const ids = new Set(branch.map((entry) => entry.id));
+  for (const reference of references) {
+    if (isPiEntryReference(reference)) {
+      const entryId = reference.slice("pi-entry:".length);
+      if (entryId.length === 0 || /\s/.test(entryId)) {
+        throw new Error(`Malformed native evidence handle ${JSON.stringify(reference)}; use exact pi-entry:<entryId> references.`);
+      }
+      if (!ids.has(entryId)) {
+        throw new Error(`Evidence entry ${JSON.stringify(entryId)} is not on the active session branch; external pointers are kept as unverified claims, never verified proof.`);
+      }
+    }
+  }
+  return splitEvidenceReferences(branch, references);
 }

@@ -42,7 +42,11 @@ The verified Pi SDK 1.1.0 runtime truncates each tool result passed into summary
 
 Garden is an agent-directed mode selected with `/rabbit mode garden`. It disables Rabbit's automatic threshold trigger, while Pi's native overflow and safety compaction remain enabled. The active agent uses the `rabbit_garden` tool to record continuity units, defer unresolved work, fold a completed unit through Pi's native compactor, compact the current mission, inspect Garden status, or restore exact evidence from a `pi-entry:<entryId>` reference.
 
-Garden units, pending requests and decision receipts are stored as bounded custom entries in the existing Pi session branch. Compaction requests run only at Pi's `turn_end` boundary, are guarded against duplicate dispatch, and produce a truthful completion/failure receipt. Garden does not delete session history or implement selective pruning. The legacy Auto, Manual and Off modes and existing `/rabbit` commands remain available.
+Garden units, pending requests and decision receipts are stored as bounded custom entries in the existing Pi session branch. Compaction requests run only at Pi's `turn_end` boundary, are guarded against duplicate dispatch, and produce a truthful completion/failure receipt. Queued requests never survive a session restart, session-tree change, or exit from Garden mode: in-flight work receives an interruption receipt and unexecuted requests a cancellation receipt (`/rabbit cancel` abandons a queued request before dispatch). Late callbacks from a previous session or mode can never mutate current state, and duplicate terminal notifications produce a single receipt.
+
+Folding context is not completing work. `record` rejects a transition to `complete` while unresolved obligations remain, and FOLD requires a unit already explicitly recorded as complete with no unresolved work; a successful native compaction never changes a unit's completion status. A fold receipt records successful *context compaction*, not acceptance of the deliverable, and failed compaction never produces a completed receipt.
+
+Evidence references distinguish verified proof from pointers: only `pi-entry:<entryId>` handles confirmed on the active session branch count as verified evidence (validated on record and restore; missing, malformed or off-branch handles are rejected). External `git:`/`file:`/`build:` references are retained as unverified pointers and surfaced as such in status and receipts. Garden does not delete session history or implement selective pruning. The legacy Auto, Manual and Off modes and existing `/rabbit` commands remain available.
 
 ## Commands
 
@@ -52,6 +56,7 @@ Garden units, pending requests and decision receipts are stored as bounded custo
 - `/rabbit threshold 90` — set a Manual trigger percentage from 1–99.
 - `/rabbit threshold adaptive` — restore Auto.
 - `/rabbit compact` — request Pi's native compactor manually.
+- `/rabbit cancel` — abandon a queued (not yet dispatched) Garden request with a truthful cancellation receipt.
 - `rabbit_garden` — the agent-directed tool for status, continuity records, DEFER, FOLD, COMPACT, and exact evidence RESTORE.
 
 The command does not disable or reconfigure Pi's own compaction safety.
