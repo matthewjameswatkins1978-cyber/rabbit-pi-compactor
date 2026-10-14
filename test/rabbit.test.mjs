@@ -518,7 +518,7 @@ test("Garden refuses duplicate requests while one compaction is queued", async (
   const state = h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
   assert.equal(state.pendingGardenRequest, undefined);
   assert.equal(state.lastGardenReceipt.status, "failed");
-  assert.match(state.lastGardenReceipt.reason, /rejected/);
+  assert.equal(state.lastGardenReceipt.reason, "compaction-failed");
 });
 
 test("Garden in-flight compaction is recorded as interrupted after session restart", async () => {

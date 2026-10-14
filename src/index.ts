@@ -1,4 +1,5 @@
-export { createRabbitExtension, RABBIT_VERSION, RECEIPT_ENTRY, STATE_ENTRY, TRACE_EXPORT_ENTRY } from "./extension.js";
+export { classifyFailure, createRabbitExtension, RABBIT_VERSION, RECEIPT_ENTRY, STATE_ENTRY, TRACE_EXPORT_ENTRY } from "./extension.js";
+export type { RabbitFailureCode } from "./extension.js";
 export { GARDEN_RECEIPT_ENTRY, isPiEntryReference, splitEvidenceReferences, validateEvidenceReferences } from "./garden.js";
 export { RABBIT_COMPACTION_INSTRUCTIONS } from "./instructions.js";
 export { AUTO_TRIGGER_PERCENT, crossedThreshold, DEFAULT_CONFIG, DEFAULT_MANUAL_TRIGGER_PERCENT, DEFAULT_OUTPUT_RESERVE_TOKENS, EMERGENCY_GUARD_PERCENT, resolvePolicy, validateConfig } from "./policy.js";
