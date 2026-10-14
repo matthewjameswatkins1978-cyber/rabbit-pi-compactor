@@ -229,6 +229,34 @@ test("classifyFailure maps known failures and passes codes through", () => {
   assert.equal(classifyFailure(undefined), "compaction-failed");
 });
 
+test("trace export allowlist rejects ADS streams and special devices", async () => {
+  const h = harness();
+  h.emit("session_start");
+  await h.command("trace on");
+  await h.command("mode garden");
+  await h.command("trace export fine-022.json");
+  assert.ok(fs.existsSync(path.join(h.cwd, "fine-022.json")), "ordinary dotted name exports");
+  const bad = [
+    "report.json:stream",
+    "report.json:stream:$DATA",
+    "CONIN$",
+    "CONOUT$",
+    "conin$.json",
+    "aux.json",
+    ".hidden.json",
+    "UPPER.JSON",
+    "sp ace.json",
+    "a".repeat(201) + ".json",
+  ];
+  for (const name of bad) {
+    await h.command(`trace export ${name}`);
+  }
+  const refusals = h.notices.filter((n) => n.includes("inside the Pi working directory"));
+  assert.equal(refusals.length, bad.length, `all ${bad.length} rejected, got ${refusals.length}`);
+  assert.deepEqual(fs.readdirSync(h.cwd).sort(), ["fine-022.json"], "allowlist created nothing else");
+  assert.ok(!fs.existsSync(path.join(h.cwd, "report.json")), "no ADS host file created");
+});
+
 test("Observe mode traces external native failures with a code and fabricates nothing", async () => {
   const CAN = "sk-live-canary-observe-1";
   const h = harness();

@@ -19,7 +19,7 @@ export const STATE_ENTRY = "rabbit-pi-compactor-state-v1";
 export const RECEIPT_ENTRY = "rabbit-pi-compactor-receipt-v1";
 export const TRACE_EXPORT_ENTRY = "rabbit-pi-compactor-trace-export-v1";
 // Keep in sync with package.json version (patch for fixes, minor for new capabilities).
-export const RABBIT_VERSION = "0.2.2";
+export const RABBIT_VERSION = "0.2.3";
 const STATUS_KEY = "rabbit-compactor";
 const MAX_TRACE_EVENTS = 200;
 const MAX_TRACE_DETAIL_CHARS = 200;
@@ -1108,20 +1108,15 @@ export function createRabbitExtension(): ExtensionFactory {
             ctx.ui.notify(`RABBIT TRACE EXPORT (${report.eventCount} event(s), capacity ${MAX_TRACE_EVENTS})\n${text.slice(0, 12000)}`, "info");
             if (value === "export" && extra) {
               try {
-                // Only a plain filename inside the Pi working directory. Lexical
-                // containment is insufficient: a symlink/junction parent inside cwd
-                // could redirect a nested path outside it. A bare name joined onto
-                // cwd cannot traverse such links.
+                // Strict allowlist for ordinary .json filenames inside the Pi working
+                // directory. Anything else is refused before touching the filesystem:
+                // separators or drive syntax could traverse a symlink/junction parent,
+                // a colon denotes an NTFS alternate data stream rather than a new file,
+                // and bare device names address devices rather than files.
                 if (
                   typeof extra !== "string" ||
-                  extra.length === 0 ||
-                  extra.length > 255 ||
-                  extra !== path.basename(extra) ||
-                  /[\\/]/.test(extra) ||
-                  /^[a-zA-Z]:/.test(extra) ||
-                  extra === "." ||
-                  extra === ".." ||
-                  /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(extra)
+                  !/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json$/.test(extra) ||
+                  /^(con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(\..*)?$/i.test(extra)
                 ) {
                   throw Object.assign(new Error("export-refused"), { code: "EXPORT_OUTSIDE_CWD" });
                 }
@@ -1143,7 +1138,7 @@ export function createRabbitExtension(): ExtensionFactory {
             }
             return;
           }
-          ctx.ui.notify("Usage: /rabbit trace on|off|export [path]", "warning");
+          ctx.ui.notify("Usage: /rabbit trace on|off|export [name]", "warning");
           return;
         }
         ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|observe|on|off|compact|cancel|threshold <1-99|adaptive>|doctor|trace on|off|export [path]", "warning");
