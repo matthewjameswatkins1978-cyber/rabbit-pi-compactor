@@ -228,3 +228,82 @@ test("classifyFailure maps known failures and passes codes through", () => {
   assert.equal(classifyFailure("compaction-failed"), "compaction-failed");
   assert.equal(classifyFailure(undefined), "compaction-failed");
 });
+
+test("Observe mode traces external native failures with a code and fabricates nothing", async () => {
+  const CAN = "sk-live-canary-observe-1";
+  const h = harness();
+  h.emit("session_start");
+  await h.command("mode observe");
+  await h.command("trace on");
+  h.emit("session_before_compact", { reason: "threshold", willRetry: false });
+  h.emit("session_compact_failed", {
+    reason: "threshold", aborted: false,
+    errorMessage: `Compaction failed: Nothing to compact (session too small) ${CAN} /etc/secret`,
+    fromExtension: false, willRetry: false,
+  });
+  await h.command("trace export");
+  const blob = h.scanAll();
+  assert.ok(!blob.includes(CAN), "observe failure trace leaks raw text");
+  assert.ok(!blob.includes("/etc/secret"), "observe failure trace leaks paths");
+  assert.match(blob, /native compaction failed reason=threshold aborted=false code=session-too-small/);
+  assert.equal(h.gardenReceipts().length, 0, "no Rabbit receipt fabricated in Observe");
+  assert.equal(h.nativeReceipts().length, 0);
+  assert.equal(h.lastState().lastError, undefined, "Observe failure touches no Rabbit state");
+  assert.equal(h.lastState().pendingGardenRequest, undefined);
+});
+
+test("stale Garden failure cannot clear a newer request's in-flight flag", async () => {
+  const h = harness();
+  await gardenMode(h);
+  await recordComplete(h, "stale-u");
+  const tool = h.tools.get("rabbit_garden");
+  await tool.execute("fold", { decision: "fold", unitId: "stale-u", reason: "First." }, undefined, undefined, h.context);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1);
+  // Restart interrupts A; a fresh fold B dispatches in the restored session.
+  h.emit("session_shutdown");
+  h.emit("session_start");
+  assert.equal(h.lastState().lastGardenReceipt.status, "interrupted");
+  await tool.execute("fold", { decision: "fold", unitId: "stale-u", reason: "Second." }, undefined, undefined, h.context);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 2);
+  const gardenBefore = h.gardenReceipts().length;
+  // Stale terminal for A must leave B's logical state untouched.
+  h.compactCalls[0].onError(new Error("late native failure for A"));
+  assert.equal(h.gardenReceipts().length, gardenBefore, "stale failure writes no receipt");
+  const status = await tool.execute("status", { decision: "status" }, undefined, undefined, h.context);
+  assert.equal(status.isError, undefined);
+  // B still completes truthfully through its own callbacks.
+  h.compactCalls[1].onComplete({ estimatedTokensAfter: 19_000 });
+  const last = h.gardenReceipts().at(-1);
+  assert.equal(last?.status, "completed");
+  assert.equal(last?.decision, "fold");
+  assert.equal(h.compactCalls.length, 2, "no duplicate dispatch from stale handling");
+});
+
+test("trace export accepts only plain filenames; links cannot redirect it", async (t) => {
+  const h = harness();
+  h.emit("session_start");
+  await h.command("trace on");
+  await h.command("mode garden");
+  await h.command("trace export ok-name.json");
+  assert.ok(fs.existsSync(path.join(h.cwd, "ok-name.json")), "plain filename still exports");
+  for (const bad of ["sub/dir.json", "../up.json", "..", ".", "C:\\abs.json", "C:rel.json", "nul", "con.txt", "a".repeat(300)]) {
+    await h.command(`trace export ${bad}`);
+  }
+  assert.ok(h.notices.filter((n) => n.includes("inside the Pi working directory")).length >= 8);
+  assert.deepEqual(fs.readdirSync(h.cwd).sort(), ["ok-name.json"], "nothing else created in cwd");
+  // A junction parent inside cwd must be unreachable: no accepted argument can name it.
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rabbit-outside-"));
+  const link = path.join(h.cwd, "linkdir");
+  try {
+    fs.symlinkSync(outside, link, "junction");
+  } catch (error) {
+    t.skip(`junction creation unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  await h.command("trace export linkdir/via-link.json");
+  await h.command("trace export linkdir");
+  assert.deepEqual(fs.readdirSync(outside), [], "junction target untouched");
+  assert.ok(!fs.existsSync(path.join(link, "via-link.json")));
+});

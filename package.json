@@ -1,6 +1,6 @@
 {
   "name": "rabbit-pi-compactor",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": false,
   "description": "Rabbit V2 compactor for Pi SDK 1.2.0.",
   "license": "MIT",

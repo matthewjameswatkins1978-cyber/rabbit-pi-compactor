@@ -19,7 +19,7 @@ export const STATE_ENTRY = "rabbit-pi-compactor-state-v1";
 export const RECEIPT_ENTRY = "rabbit-pi-compactor-receipt-v1";
 export const TRACE_EXPORT_ENTRY = "rabbit-pi-compactor-trace-export-v1";
 // Keep in sync with package.json version (patch for fixes, minor for new capabilities).
-export const RABBIT_VERSION = "0.2.1";
+export const RABBIT_VERSION = "0.2.2";
 const STATUS_KEY = "rabbit-compactor";
 const MAX_TRACE_EVENTS = 200;
 const MAX_TRACE_DETAIL_CHARS = 200;
@@ -260,10 +260,12 @@ export function createRabbitExtension(): ExtensionFactory {
     };
     const failGardenRequest = (ctx: ExtensionContext, requestId: string, reason: string) => {
       const request = state.pendingGardenRequest;
-      // A terminal failure notification always releases the logical flag, even
-      // for an already-settled (stale duplicate) request: the op is acknowledged.
-      compactionInFlight = false;
+      // Only the current pending request's own terminal notification releases
+      // the logical flag. A stale or duplicate notification must not clear the
+      // in-flight state belonging to a newer request (the physical guard still
+      // prevents any overlap independently).
       if (!request || request.requestId !== requestId || settledGardenRequests.has(requestId)) return;
+      compactionInFlight = false;
       settledGardenRequests.add(requestId);
       trace("callback-outcome", `garden ${request.decision} failed: ${reason.slice(0, 120)}`, { requestId });
       const split = gardenEvidenceSplit(ctx, request);
@@ -334,7 +336,6 @@ export function createRabbitExtension(): ExtensionFactory {
       const operationGeneration = generation;
       const operationSessionId = sessionId;
       const inFlight: GardenRequest = { ...request, status: "in-flight" };
-      compactionInFlight = true;
       state = { ...state, pendingGardenRequest: inFlight, lastError: undefined, armed: false };
       const started: GardenReceipt = {
         version: 1, decision: request.decision, status: "started",
@@ -407,6 +408,7 @@ export function createRabbitExtension(): ExtensionFactory {
           publish(ctx);
           return false;
         }
+        compactionInFlight = true;
       } catch (error) {
         failGardenRequest(ctx, request.requestId, classifyFailure(error));
       }
@@ -485,7 +487,6 @@ export function createRabbitExtension(): ExtensionFactory {
       trace("threshold-decision", `${state.mode} crossed ${policy.targetPercent.toFixed(0)}% at ${usage.percent.toFixed(1)}%${emergency ? " (emergency)" : ""}; requesting native compaction`, { tokens: usage.tokens, percent: usage.percent });
       const operationGeneration = generation;
       const operationSessionId = sessionId;
-      compactionInFlight = true;
       state = {
         ...state,
         armed: false,
@@ -570,6 +571,7 @@ export function createRabbitExtension(): ExtensionFactory {
           publish(ctx);
           return;
         }
+        compactionInFlight = true;
       } catch (error) {
         const autoCatchCode = classifyFailure(error);
         compactionInFlight = false;
@@ -592,7 +594,6 @@ export function createRabbitExtension(): ExtensionFactory {
         ctx.ui.notify("Rabbit cannot compact while Pi is busy or compaction is unavailable.", "warning");
         return;
       }
-      compactionInFlight = true;
       state = { ...state, armed: false, emergencyRetryEligible: false };
       const beforeUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       const manualPolicy = resolvePolicy(beforeUsage?.contextWindow, state.config, beforeUsage?.reserveTokens);
@@ -663,10 +664,10 @@ export function createRabbitExtension(): ExtensionFactory {
         },
       });
       if (!manualStarted) {
-        compactionInFlight = false;
         publish(ctx);
         return;
       }
+      compactionInFlight = true;
       // Compact is fire-and-forget; synchronous failures still need visible status.
       } catch (error) {
         const manualCatchCode = classifyFailure(error);
@@ -681,6 +682,12 @@ export function createRabbitExtension(): ExtensionFactory {
     pi.on("session_start", (_event, ctx) => {
       generation += 1;
       trace("session-change", "session_start; queued Garden work never survives restart");
+      // A session boundary replaces Pi's per-session compaction controllers, so
+      // any pre-boundary native op is dead or belongs to a dead session: the
+      // physical guard restarts fresh here. Same-session transitions (mode,
+      // threshold, manual) never reset it. Stale terminals clear idempotently.
+      nativeOp = undefined;
+      nativeObserved = false;
       active = true;
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
@@ -699,6 +706,10 @@ export function createRabbitExtension(): ExtensionFactory {
     pi.on("session_tree", (_event, ctx) => {
       generation += 1;
       trace("session-change", "session_tree; queued Garden work never survives tree change");
+      // Same-session tree object or replacement: either way the pre-change op
+      // cannot still own the current wire; see session_start above.
+      nativeOp = undefined;
+      nativeObserved = false;
       compactionInFlight = false;
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
@@ -760,9 +771,12 @@ export function createRabbitExtension(): ExtensionFactory {
       publish(ctx);
     });
     pi.on("session_compact_failed", (event, ctx) => {
+      if (!current(ctx)) return;
       nativeObserved = false;
-      if (!current(ctx) || !compactionInFlight) return;
-      trace("callback-outcome", `native compaction failed reason=${event.reason} aborted=${event.aborted}`);
+      // Native failures are traced with a stable code even when Rabbit owns no
+      // request (e.g. Observe mode): observation only, never a Rabbit receipt.
+      trace("callback-outcome", `native compaction failed reason=${event.reason} aborted=${event.aborted} code=${event.aborted ? "compaction-cancelled" : classifyFailure(event.errorMessage ?? "Pi compaction failed.")}`);
+      if (!compactionInFlight) return;
       if (state.pendingGardenRequest?.status === "in-flight") {
         failGardenRequest(ctx, state.pendingGardenRequest.requestId, classifyFailure(event.errorMessage ?? "Pi compaction failed."));
         return;
@@ -1094,12 +1108,24 @@ export function createRabbitExtension(): ExtensionFactory {
             ctx.ui.notify(`RABBIT TRACE EXPORT (${report.eventCount} event(s), capacity ${MAX_TRACE_EVENTS})\n${text.slice(0, 12000)}`, "info");
             if (value === "export" && extra) {
               try {
-                if (path.isAbsolute(extra)) throw Object.assign(new Error("export-refused"), { code: "EXPORT_OUTSIDE_CWD" });
-                const resolved = path.resolve(ctx.cwd, extra);
-                const contained = path.relative(ctx.cwd, resolved);
-                if (contained === "" || contained.startsWith("..") || path.isAbsolute(contained)) {
+                // Only a plain filename inside the Pi working directory. Lexical
+                // containment is insufficient: a symlink/junction parent inside cwd
+                // could redirect a nested path outside it. A bare name joined onto
+                // cwd cannot traverse such links.
+                if (
+                  typeof extra !== "string" ||
+                  extra.length === 0 ||
+                  extra.length > 255 ||
+                  extra !== path.basename(extra) ||
+                  /[\\/]/.test(extra) ||
+                  /^[a-zA-Z]:/.test(extra) ||
+                  extra === "." ||
+                  extra === ".." ||
+                  /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(extra)
+                ) {
                   throw Object.assign(new Error("export-refused"), { code: "EXPORT_OUTSIDE_CWD" });
                 }
+                const resolved = path.join(ctx.cwd, extra);
                 fs.writeFileSync(resolved, text, { encoding: "utf8", flag: "wx" });
                 ctx.ui.notify(`Rabbit trace report written to ${resolved}.`, "info");
               } catch (error) {
