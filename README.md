@@ -4,7 +4,7 @@ An adaptive policy layer around Pi's native compactor. Rabbit schedules an early
 
 ## Compatibility
 
-- Pi SDK: **1.1.0**
+- Pi SDK: **1.2.0** (extension API verified against the installed Pi 1.2.0 CLI)
 - Gary Pi: loads Rabbit through Pi's native extension loader after Pi installs it to the shared user or project package settings.
 - Does not modify Pi's `reserveTokens` or replace the native compaction engine.
 
@@ -30,7 +30,7 @@ Rabbit uses the active model's `contextWindow` and token count from Pi's `getCon
 
 Auto triggers on a measured crossing of 88% of the active model's effective budget. After a failed normal attempt, the initial emergency guard permits one bounded retry at a crossing of 96%. These are operational starting points, not universal optima. The effective budget is the reported context window less Pi's configured output reserve (including the exact provider/model override, when present). The numerator is Pi's measured context token count, which already includes the serialized system prompt and conversation; Rabbit does not subtract system prompt, messages, or tool output again. The default reserve is 16,384 tokens when no valid Pi setting is available. Manual accepts a 1–99% trigger on that same effective budget, defaulting to 90% when Manual is selected without an explicit value. Trigger pressure is separate from retention: Pi continues to own its recent-message tail and summary cut point.
 
-Choose a mode with `/rabbit mode auto|manual|off|garden`. `/rabbit threshold 1-99` selects Manual with that threshold; `/rabbit threshold adaptive` returns to Auto. `/rabbit on` re-enables the last Auto or Manual configuration; `/rabbit off` selects Off. Mode and Manual threshold are persisted in the session's existing custom entries. A completed compaction discards the pre-compaction crossing baseline, reads Pi's current measurement again, records a receipt, and rearms only after measured usage is below the hysteresis boundary.
+Choose a mode with `/rabbit mode auto|manual|off|garden|observe`. `observe` records pressure for diagnostics but never requests compaction. `/rabbit threshold 1-99` selects Manual with that threshold; `/rabbit threshold adaptive` returns to Auto. `/rabbit on` re-enables the last Auto or Manual configuration; `/rabbit off` selects Off. Mode and Manual threshold are persisted in the session's existing custom entries. A completed compaction discards the pre-compaction crossing baseline, reads Pi's current measurement again, records a receipt, and rearms only after measured usage is below the hysteresis boundary.
 
 Rabbit requires an observed token-count crossing from at-or-below the exact trigger token to above it, then rearms after measured usage falls below the trigger by the configured hysteresis. It invokes `ctx.compact()` without awaiting it. Unknown (`null`) token usage never counts as zero and never triggers a compact. Auto uses one conservative model-relative rule across small and large windows; it does not claim to be an empirically optimal curve.
 
@@ -51,12 +51,14 @@ Evidence references distinguish verified proof from pointers: only `pi-entry:<en
 ## Commands
 
 - `/rabbit status` — show mode, selected model, context use, output reserve, effective budget, trigger, armed state, sequence count, and method.
-- `/rabbit mode auto|manual|off|garden` — select the operating mode.
+- `/rabbit mode auto|manual|off|garden|observe` — select the operating mode (`observe` never requests compaction).
 - `/rabbit off` / `/rabbit on` — select Off or re-enable the prior Auto/Manual configuration.
 - `/rabbit threshold 90` — set a Manual trigger percentage from 1–99.
 - `/rabbit threshold adaptive` — restore Auto.
 - `/rabbit compact` — request Pi's native compactor manually.
 - `/rabbit cancel` — abandon a queued (not yet dispatched) Garden request with a truthful cancellation receipt.
+- `/rabbit doctor` — sanitised compatibility, state, policy and safety report, split into observed / estimated / inferred / missing sections.
+- `/rabbit trace on|off|export [path]` — bounded sanitised event capture (200 events max, metadata only: no prompts, contents, keys or credentials); `export` notifies, stores the last 50 events in session history, and optionally writes the full JSON report to a file.
 - `rabbit_garden` — the agent-directed tool for status, continuity records, DEFER, FOLD, COMPACT, and exact evidence RESTORE.
 
 The command does not disable or reconfigure Pi's own compaction safety.

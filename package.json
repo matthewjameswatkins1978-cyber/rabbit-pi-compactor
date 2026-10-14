@@ -1,8 +1,8 @@
 {
   "name": "rabbit-pi-compactor",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": false,
-  "description": "Rabbit V2 compactor for Pi SDK 1.1.0.",
+  "description": "Rabbit V2 compactor for Pi SDK 1.2.0.",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.25.0",
@@ -15,7 +15,7 @@
     "test": "pnpm build && node --test test/*.test.mjs"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
     "@types/node": "^22.19.0",
     "typescript": "^5.9.3"
   },

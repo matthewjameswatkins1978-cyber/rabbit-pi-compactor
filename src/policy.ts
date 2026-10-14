@@ -1,4 +1,4 @@
-export type RabbitMode = "auto" | "manual" | "off" | "garden";
+export type RabbitMode = "auto" | "manual" | "off" | "garden" | "observe";
 
 export interface RabbitConfig {
   /** Manual trigger percentage. Auto uses AUTO_TRIGGER_PERCENT. */

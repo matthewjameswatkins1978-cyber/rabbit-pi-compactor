@@ -6,6 +6,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, DEFAULT_MANUAL_TRIGGER_PERCENT, DEFAULT_OUTPUT_RESERVE_TOKENS, crossedThreshold, resolvePolicy, validateConfig } from "./policy.js";
 import type { RabbitConfig, RabbitMode } from "./policy.js";
+import fs from "node:fs";
+import path from "node:path";
 import { Type } from "typebox";
 import { RABBIT_COMPACTION_INSTRUCTIONS } from "./instructions.js";
 
@@ -14,7 +16,12 @@ import type { GardenReceipt, GardenRequest, GardenUnit, GardenToolInput } from "
 
 export const STATE_ENTRY = "rabbit-pi-compactor-state-v1";
 export const RECEIPT_ENTRY = "rabbit-pi-compactor-receipt-v1";
+export const TRACE_EXPORT_ENTRY = "rabbit-pi-compactor-trace-export-v1";
+// Keep in sync with package.json version (patch for fixes, minor for new capabilities).
+export const RABBIT_VERSION = "0.2.0";
 const STATUS_KEY = "rabbit-compactor";
+const MAX_TRACE_EVENTS = 200;
+const MAX_TRACE_DETAIL_CHARS = 200;
 
 interface PersistedState {
   readonly kind: "rabbit-state";
@@ -80,7 +87,7 @@ function validState(value: unknown): value is PersistedState {
   } catch {
     return false;
   }
-  return item.kind === "rabbit-state" && (item.mode === "auto" || item.mode === "manual" || item.mode === "off" || item.mode === "garden" || typeof item.enabled === "boolean") && typeof item.armed === "boolean";
+  return item.kind === "rabbit-state" && (item.mode === "auto" || item.mode === "manual" || item.mode === "off" || item.mode === "garden" || item.mode === "observe" || typeof item.enabled === "boolean") && typeof item.armed === "boolean";
 }
 
 function restore(ctx: ExtensionContext): PersistedState {
@@ -117,6 +124,43 @@ export function createRabbitExtension(): ExtensionFactory {
     // Terminal Garden request ids already receipted in this process. Guards
     // duplicate session_compact_failed / onError / lifecycle notifications.
     const settledGardenRequests = new Set<string>();
+    // Bounded in-memory diagnostics. Trace holds sanitised metadata only
+    // (kinds, counts, percentages, mode names, request ids, short reasons):
+    // never prompts, message bodies, tool output, keys, or credentials.
+    type TraceKind =
+      | "pressure" | "threshold-decision" | "mode-transition"
+      | "queued" | "dispatched" | "native-compact" | "callback-outcome"
+      | "session-change" | "cancelled" | "recovery";
+    interface TraceEvent {
+      readonly seq: number;
+      readonly t: string;
+      readonly kind: TraceKind;
+      readonly detail: string;
+      readonly tokens?: number;
+      readonly percent?: number;
+      readonly requestId?: string;
+    }
+    let traceEnabled = false;
+    let traceSeq = 0;
+    const traceEvents: TraceEvent[] = [];
+    const trace = (kind: TraceKind, detail: string, extra?: { tokens?: number; percent?: number; requestId?: string }): void => {
+      try {
+        if (!traceEnabled) return;
+        traceSeq += 1;
+        traceEvents.push({
+          seq: traceSeq,
+          t: new Date().toISOString(),
+          kind,
+          detail: detail.slice(0, MAX_TRACE_DETAIL_CHARS),
+          ...(extra?.tokens !== undefined ? { tokens: extra.tokens } : {}),
+          ...(extra?.percent !== undefined ? { percent: extra.percent } : {}),
+          ...(extra?.requestId !== undefined ? { requestId: extra.requestId.slice(0, 128) } : {}),
+        });
+        if (traceEvents.length > MAX_TRACE_EVENTS) traceEvents.splice(0, traceEvents.length - MAX_TRACE_EVENTS);
+      } catch {
+        // Diagnostics must never break compaction behaviour.
+      }
+    };
 
     const current = (ctx: ExtensionContext): boolean => {
       try {
@@ -135,6 +179,7 @@ export function createRabbitExtension(): ExtensionFactory {
       if (state.mode === "off") label = "🐇 off";
       else if (compactionInFlight) label = "🐇 compacting…";
       else if (state.mode === "garden") label = `🐇 garden · ${state.gardenUnits?.filter((unit) => unit.status !== "complete").length ?? 0} units`;
+      else if (state.mode === "observe") label = "🐇 observe · never compacts";
       else if (!currentUsage && state.lastError) label = "🐇 compact failed";
       else if (!currentUsage && state.lastCompactionAt) label = "🐇 compacted";
       else if (usage && policy) {
@@ -175,6 +220,7 @@ export function createRabbitExtension(): ExtensionFactory {
       const request = state.pendingGardenRequest;
       if (!request || request.requestId !== requestId || settledGardenRequests.has(requestId)) return;
       settledGardenRequests.add(requestId);
+      trace("callback-outcome", `garden ${request.decision} failed: ${reason.slice(0, 120)}`, { requestId });
       compactionInFlight = false;
       const split = gardenEvidenceSplit(ctx, request);
       const receipt: GardenReceipt = {
@@ -199,6 +245,7 @@ export function createRabbitExtension(): ExtensionFactory {
       const request = state.pendingGardenRequest;
       if (!request || settledGardenRequests.has(request.requestId)) return false;
       settledGardenRequests.add(request.requestId);
+      trace("cancelled", `garden ${request.decision} ${status}: ${reason.slice(0, 120)}`, { requestId: request.requestId });
       compactionInFlight = false;
       const split = gardenEvidenceSplit(ctx, request);
       const receipt: GardenReceipt = {
@@ -251,12 +298,18 @@ export function createRabbitExtension(): ExtensionFactory {
       persist();
       publish(ctx);
       const usage = readUsage(ctx, outputReserveTokens(pi, ctx));
+      trace("dispatched", `garden ${request.decision} dispatched to native compaction`, {
+        requestId: request.requestId,
+        ...(usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
+        ...(usage?.percent !== undefined ? { percent: usage.percent } : {}),
+      });
       try {
         ctx.compact({
           customInstructions: gardenInstructions(request),
           onComplete: (result) => {
             if (!active || generation !== operationGeneration || sessionId !== operationSessionId || state.pendingGardenRequest?.requestId !== request.requestId || settledGardenRequests.has(request.requestId)) return;
             settledGardenRequests.add(request.requestId);
+            trace("callback-outcome", `garden ${request.decision} completed`, { requestId: request.requestId });
             compactionInFlight = false;
             const timestamp = new Date().toISOString();
             const after = readUsage(ctx, outputReserveTokens(pi, ctx));
@@ -309,6 +362,20 @@ export function createRabbitExtension(): ExtensionFactory {
         publish(ctx);
         return;
       }
+      if (state.mode === "observe") {
+        // Observe mode records pressure for diagnostics but never compacts.
+        const observed = readUsage(ctx, outputReserveTokens(pi, ctx));
+        if (observed) {
+          latestUsage = observed;
+          previousValidTokens = observed.tokens;
+          trace("pressure", `observed ${observed.percent.toFixed(1)}% effective; never compacts`, { tokens: observed.tokens, percent: observed.percent });
+        } else {
+          previousValidTokens = undefined;
+          trace("pressure", "usage unknown; never compacts");
+        }
+        publish(ctx);
+        return;
+      }
       const usage = readUsage(ctx, outputReserveTokens(pi, ctx));
       if (!usage) {
         // Null tokens after compaction are unknown, never zero or a trigger.
@@ -358,6 +425,7 @@ export function createRabbitExtension(): ExtensionFactory {
         return;
       }
 
+      trace("threshold-decision", `${state.mode} crossed ${policy.targetPercent.toFixed(0)}% at ${usage.percent.toFixed(1)}%${emergency ? " (emergency)" : ""}; requesting native compaction`, { tokens: usage.tokens, percent: usage.percent });
       const operationGeneration = generation;
       const operationSessionId = sessionId;
       compactionInFlight = true;
@@ -378,6 +446,7 @@ export function createRabbitExtension(): ExtensionFactory {
           onComplete: (result) => {
             if (!active || generation !== operationGeneration || sessionId !== operationSessionId) return;
             compactionInFlight = false;
+            trace("callback-outcome", `${state.mode} compaction completed`);
             const timestamp = new Date().toISOString();
             const postCompactUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
             previousValidTokens = undefined;
@@ -431,6 +500,7 @@ export function createRabbitExtension(): ExtensionFactory {
           onError: (error) => {
             if (!active || generation !== operationGeneration || sessionId !== operationSessionId) return;
             compactionInFlight = false;
+            trace("callback-outcome", `${state.mode} compaction failed: ${error.message.slice(0, 120)}`);
             state = { ...state, armed: false, lastError: error.message };
             persist();
             publish(ctx);
@@ -445,6 +515,10 @@ export function createRabbitExtension(): ExtensionFactory {
       }
     };
     const manualCompact = (ctx: ExtensionCommandContext) => {
+      if (state.mode === "observe") {
+        ctx.ui.notify("Rabbit Observe mode never requests compaction; switch modes to compact.", "warning");
+        return;
+      }
       if (!ctx.isIdle() || compactionInFlight || typeof ctx.compact !== "function") {
         ctx.ui.notify("Rabbit cannot compact while Pi is busy or compaction is unavailable.", "warning");
         return;
@@ -465,6 +539,7 @@ export function createRabbitExtension(): ExtensionFactory {
         onComplete: (result) => {
           if (generation !== operationGeneration || sessionId !== operationSessionId) return;
           compactionInFlight = false;
+          trace("callback-outcome", "manual compaction completed");
           state = {
             ...state,
             armed: false,
@@ -527,6 +602,7 @@ export function createRabbitExtension(): ExtensionFactory {
 
     pi.on("session_start", (_event, ctx) => {
       generation += 1;
+      trace("session-change", "session_start; queued Garden work never survives restart");
       active = true;
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
@@ -544,6 +620,7 @@ export function createRabbitExtension(): ExtensionFactory {
     });
     pi.on("session_tree", (_event, ctx) => {
       generation += 1;
+      trace("session-change", "session_tree; queued Garden work never survives tree change");
       compactionInFlight = false;
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
@@ -558,6 +635,7 @@ export function createRabbitExtension(): ExtensionFactory {
     });
     pi.on("session_shutdown", () => {
       generation += 1;
+      trace("session-change", "session_shutdown");
       active = false;
       compactionInFlight = false;
       previousValidTokens = undefined;
@@ -571,14 +649,21 @@ export function createRabbitExtension(): ExtensionFactory {
     pi.on("model_select", (_event, ctx) => {
       latestUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       previousValidTokens = latestUsage?.tokens;
+      trace("recovery", "model changed; crossing baseline reset and rearmed");
       state = { ...state, armed: true };
       state = { ...state, emergencyAttempted: false, emergencyRetryEligible: false };
       needsPressureCheck = true;
       persist();
       publish(ctx);
     });
+    pi.on("session_before_compact", (event, ctx) => {
+      // Passive observer only: Rabbit never cancels or rewrites native compaction.
+      if (!current(ctx)) return;
+      trace("native-compact", `before-compact reason=${event.reason} willRetry=${event.willRetry}`);
+    });
     pi.on("session_compact", (event, ctx) => {
       if (!current(ctx)) return;
+      trace("native-compact", `compacted reason=${event.reason} fromExtension=${event.fromExtension} willRetry=${event.willRetry}`);
       const details = event.compactionEntry?.details;
       completedMethod = !event.fromExtension
         ? "pi-local"
@@ -596,6 +681,7 @@ export function createRabbitExtension(): ExtensionFactory {
     });
     pi.on("session_compact_failed", (event, ctx) => {
       if (!current(ctx) || !compactionInFlight) return;
+      trace("callback-outcome", `native compaction failed reason=${event.reason} aborted=${event.aborted}`);
       if (state.pendingGardenRequest?.status === "in-flight") {
         failGardenRequest(ctx, state.pendingGardenRequest.requestId, event.errorMessage ?? "Pi compaction failed.");
         return;
@@ -629,7 +715,10 @@ export function createRabbitExtension(): ExtensionFactory {
       execute: async (_toolCallId, rawInput, _signal, _onUpdate, ctx) => {
         try {
           const input: GardenToolInput = validateGardenToolInput(rawInput);
-          if (input.decision !== "status" && state.mode !== "garden") {
+          if (state.mode === "observe" && (input.decision === "fold" || input.decision === "compact")) {
+            throw new Error("Rabbit Observe mode never requests compaction; switch to garden to queue compaction.");
+          }
+          if (input.decision !== "status" && state.mode !== "garden" && state.mode !== "observe") {
             throw new Error("Set Rabbit mode to garden with /rabbit mode garden before making Garden decisions.");
           }
           if (input.decision === "status") {
@@ -705,6 +794,7 @@ export function createRabbitExtension(): ExtensionFactory {
             status: "queued",
           };
           state = { ...state, pendingGardenRequest: request };
+          trace("queued", `garden ${request.decision} queued for the next Pi turn_end boundary`, { requestId: request.requestId });
           const scheduleSplit = splitEvidenceReferences(ctx.sessionManager.getBranch(), gardenEvidenceFor(request));
           const receipt: GardenReceipt = {
             version: 1, decision: request.decision, status: "scheduled",
@@ -727,7 +817,7 @@ export function createRabbitExtension(): ExtensionFactory {
       description: "Inspect and configure Rabbit Pi Compactor and Garden mode",
       handler: async (args, ctx) => {
         context = ctx;
-        const [requestedOperation, value] = args.trim().split(/\s+/, 2);
+        const [requestedOperation, value, extra] = args.trim().split(/\s+/, 3);
         const operation = requestedOperation || "status";
         if (operation === "status") {
           const currentUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
@@ -742,7 +832,7 @@ export function createRabbitExtension(): ExtensionFactory {
             `mode: ${state.mode}`,
             `model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown"}`,
             `context: ${currentUsage && policy ? `${currentUsage.tokens.toLocaleString()} / ${policy.effectiveBudget.toLocaleString()} effective (${currentUsage.percent.toFixed(1)}%); window ${currentUsage.contextWindow.toLocaleString()}, output reserve ${policy.reserveTokens.toLocaleString()}` : usage ? `unknown; last observed ${usage.percent.toFixed(1)}% effective` : "unknown"}`,
-            `trigger: ${state.mode === "garden" ? "agent-directed (Pi overflow safety active)" : policy ? `${policy.targetPercent.toFixed(1)}% (${policy.band})` : "waiting for context usage"}`,
+            `trigger: ${state.mode === "garden" ? "agent-directed (Pi overflow safety active)" : state.mode === "observe" ? "observe (never compacts; Pi overflow safety active)" : policy ? `${policy.targetPercent.toFixed(1)}% (${policy.band})` : "waiting for context usage"}`,
             `emergency guard: ${state.mode === "garden" ? "Pi native overflow safety" : policy ? `${policy.emergencyPercent}%` : "unavailable"}`,
             `state: ${compactionInFlight ? "compacting" : state.mode === "garden" ? "awaiting agent decision" : state.armed ? "armed" : "hysteresis"}`,
             `compactions: ${ctx.sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === RECEIPT_ENTRY).length}`,
@@ -789,10 +879,11 @@ export function createRabbitExtension(): ExtensionFactory {
           return;
         }
         if (operation === "mode") {
-          if (value !== "auto" && value !== "manual" && value !== "off" && value !== "garden") {
-            ctx.ui.notify("Usage: /rabbit mode auto|manual|off|garden", "warning");
+          if (value !== "auto" && value !== "manual" && value !== "off" && value !== "garden" && value !== "observe") {
+            ctx.ui.notify("Usage: /rabbit mode auto|manual|off|garden|observe", "warning");
             return;
           }
+          const previousMode = state.mode;
           const leavingGarden = state.mode === "garden" && value !== "garden";
           state = {
             ...state,
@@ -813,12 +904,20 @@ export function createRabbitExtension(): ExtensionFactory {
           persist();
           publish(ctx);
           ctx.ui.notify(`Rabbit mode set to ${value}.`, "info");
+          trace("mode-transition", `${previousMode} -> ${value}`);
           return;
         }
         if (operation === "threshold") {
           try {
             const thresholdOverride = value === "adaptive" ? null : Number(value);
+            const thresholdPreviousMode = state.mode;
             state = { ...state, mode: value === "adaptive" ? "auto" : "manual", config: validateConfig({ ...state.config, thresholdOverride }) };
+            if (thresholdPreviousMode === "garden" && state.pendingGardenRequest) {
+              // Same guarantee as /rabbit mode: leaving Garden never carries a queued request.
+              generation += 1;
+              invalidatePendingGardenRequest(ctx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
+            }
+            trace("mode-transition", `threshold ${thresholdPreviousMode} -> ${state.mode}`);
             previousValidTokens = readUsage(ctx, outputReserveTokens(pi, ctx))?.tokens;
             needsPressureCheck = value !== "adaptive";
             persist();
@@ -832,7 +931,101 @@ export function createRabbitExtension(): ExtensionFactory {
           }
           return;
         }
-        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|on|off|compact|cancel|threshold <1-99|adaptive>", "warning");
+        if (operation === "doctor") {
+          const currentUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
+          if (currentUsage) latestUsage = currentUsage;
+          const usage = currentUsage ?? latestUsage;
+          const policy = resolvePolicy(usage?.contextWindow, state.config, usage?.reserveTokens);
+          const branch = (() => { try { return ctx.sessionManager.getBranch(); } catch { return []; } })();
+          const receiptCount = branch.filter((entry) => entry.type === "custom" && entry.customType === RECEIPT_ENTRY).length;
+          const report = {
+            rabbit: RABBIT_VERSION,
+            observed: {
+              mode: state.mode,
+              sessionMatch: current(ctx),
+              compactionInFlight,
+              armed: state.armed,
+              pendingGardenRequest: state.pendingGardenRequest?.status ?? "none",
+              nativeCompactAvailable: typeof ctx.compact === "function",
+              model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
+              receiptCount,
+              traceEventsCaptured: traceEvents.length,
+            },
+            estimated: {
+              contextPercent: usage ? Number(usage.percent.toFixed(1)) : null,
+              contextTokens: usage?.tokens ?? null,
+              effectiveBudget: policy?.effectiveBudget ?? null,
+              lastEstimatedTokensAfter: state.lastEstimatedTokensAfter ?? null,
+            },
+            inferred: {
+              trigger: state.mode === "observe" || state.mode === "garden" ? "agent-directed or none (Pi overflow safety active)" : policy ? `${policy.targetPercent}% of effective budget` : "waiting for first measurement",
+              rearm: state.armed ? "armed" : "hysteresis until usage recovers",
+            },
+            missing: [
+              ...(usage ? [] : ["no context-usage measurement yet"]),
+              ...(policy ? [] : ["no compaction policy (unknown context window)"]),
+              ...(state.lastCompactionAt ? [] : ["no compaction observed yet"]),
+            ],
+            safety: [
+              "Pi owns summarisation, retention, overflow recovery, and safety compaction; Rabbit never replaces them",
+              "Rabbit never disables Pi native automatic compaction",
+              "Queued Garden requests never survive restart, tree change, or leaving Garden mode",
+              "Unknown measurements never count as zero and never trigger",
+              ...(state.mode === "observe" ? ["Observe mode never requests compaction"] : []),
+            ],
+            ...(state.lastError ? { lastError: state.lastError } : {}),
+          };
+          ctx.ui.notify(`RABBIT DOCTOR\n${JSON.stringify(report, null, 2).slice(0, 8000)}`, "info");
+          return;
+        }
+        if (operation === "trace") {
+          if (value === "on") {
+            traceEnabled = true;
+            ctx.ui.notify("Rabbit trace capture on (bounded sanitised metadata only).", "info");
+            return;
+          }
+          if (value === "off") {
+            traceEnabled = false;
+            ctx.ui.notify(`Rabbit trace capture off; retained ${traceEvents.length} bounded event(s).`, "info");
+            return;
+          }
+          if (value === "export" || value === undefined) {
+            const report = {
+              version: 1,
+              rabbit: RABBIT_VERSION,
+              exportedAt: new Date().toISOString(),
+              captureEnabled: traceEnabled,
+              mode: state.mode,
+              eventCount: traceEvents.length,
+              retainedCapacity: MAX_TRACE_EVENTS,
+              observed: "events below are recorded extension callbacks and decisions",
+              estimated: "token/percent fields are Pi measurements or Pi estimates, not exact usage",
+              inferred: "ordering follows callback arrival; native internals are not visible",
+              missing: traceEnabled ? [] : ["capture was off for some or all of this session; enable with /rabbit trace on"],
+              events: traceEvents,
+            };
+            const text = JSON.stringify(report, null, 2);
+            try {
+              pi.appendEntry(TRACE_EXPORT_ENTRY, { ...report, events: report.events.slice(-50) });
+            } catch {
+              // Session history may be unavailable; the notify channel still carries the report.
+            }
+            ctx.ui.notify(`RABBIT TRACE EXPORT (${report.eventCount} event(s), capacity ${MAX_TRACE_EVENTS})\n${text.slice(0, 12000)}`, "info");
+            if (value === "export" && extra) {
+              try {
+                const resolved = path.resolve(ctx.cwd, extra);
+                fs.writeFileSync(resolved, text, "utf8");
+                ctx.ui.notify(`Rabbit trace report written to ${resolved}.`, "info");
+              } catch (error) {
+                ctx.ui.notify(`Rabbit trace export failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+              }
+            }
+            return;
+          }
+          ctx.ui.notify("Usage: /rabbit trace on|off|export [path]", "warning");
+          return;
+        }
+        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|observe|on|off|compact|cancel|threshold <1-99|adaptive>|doctor|trace on|off|export [path]", "warning");
       },
     });
   };
