@@ -1,8 +1,8 @@
 {
   "name": "rabbit-pi-compactor",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "private": false,
-  "description": "Adaptive context compaction for Pi SDK 1.0.0. 🐇",
+  "description": "Rabbit V2 compactor for Pi SDK 1.2.0.",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.25.0",
@@ -14,11 +14,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build && node --test test/*.test.mjs"
   },
-  "dependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.0"
-  },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.2.0",
     "@types/node": "^22.19.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "typebox": "1.3.27"
   }
 }
