@@ -5,10 +5,14 @@ import type {
   ExtensionFactory,
   CompactOptions,
 } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONFIG, DEFAULT_MANUAL_TRIGGER_PERCENT, DEFAULT_OUTPUT_RESERVE_TOKENS, crossedThreshold, resolvePolicy, validateConfig } from "./policy.js";
-import type { RabbitConfig, RabbitMode } from "./policy.js";
+import { DEFAULT_CONFIG, DEFAULT_MANUAL_TRIGGER_PERCENT, DEFAULT_OUTPUT_RESERVE_TOKENS, SMART_AUTO_PRESSURE_FLOOR_PERCENT, crossedThreshold, decideSmartAuto, resolvePolicy, validateConfig } from "./policy.js";
+import type { RabbitConfig, RabbitMode, SmartAutoDecision } from "./policy.js";
 import fs from "node:fs";
 import path from "node:path";
+import { DEFAULT_FILE_CONFIG, globalConfigPath, loadFileConfig, migrateSessionThreshold, saveFileConfig, validateFileConfig } from "./config.js";
+import type { PreservationPreset, RabbitFileConfig } from "./config.js";
+import { PRESET_LABELS, presetInstructions } from "./presets.js";
+import { openRabbitMenu } from "./menu.js";
 import { Type } from "typebox";
 import { RABBIT_COMPACTION_INSTRUCTIONS } from "./instructions.js";
 
@@ -19,7 +23,7 @@ export const STATE_ENTRY = "rabbit-pi-compactor-state-v1";
 export const RECEIPT_ENTRY = "rabbit-pi-compactor-receipt-v1";
 export const TRACE_EXPORT_ENTRY = "rabbit-pi-compactor-trace-export-v1";
 // Keep in sync with package.json version (patch for fixes, minor for new capabilities).
-export const RABBIT_VERSION = "0.2.3";
+export const RABBIT_VERSION = "0.3.0";
 const STATUS_KEY = "rabbit-compactor";
 const MAX_TRACE_EVENTS = 200;
 const MAX_TRACE_DETAIL_CHARS = 200;
@@ -48,6 +52,7 @@ interface PersistedState {
   readonly lastCompactionAt?: string;
   readonly lastEstimatedTokensAfter?: number | undefined;
   readonly lastError?: string | undefined;
+  readonly lastSmartReason?: string | undefined;
   readonly gardenUnits?: readonly GardenUnit[];
   readonly pendingGardenRequest?: GardenRequest;
   readonly lastGardenReceipt?: GardenReceipt;
@@ -211,7 +216,86 @@ export function createRabbitExtension(): ExtensionFactory {
         return false;
       }
     };
-    const persist = () => pi.appendEntry(STATE_ENTRY, state);
+    const persist = () => {
+      try {
+        pi.appendEntry(STATE_ENTRY, state);
+      } catch {
+        // Session history may be unavailable; the durable file still persists.
+      }
+      saveDurableFromState();
+    };
+    // Authoritative file configuration (Milestone A): global preferences live in
+    // ~/.pi/agent/rabbit.json (RABBIT_CONFIG_PATH overrides for tests). Session
+    // custom entries keep Garden units and receipts only. Best-effort: file I/O
+    // never breaks live compaction behaviour.
+    let durable: RabbitFileConfig = { ...DEFAULT_FILE_CONFIG };
+    let durablePath = "";
+    let durablePresent = false;
+    let durableLoaded = false;
+    const humanModeName = (mode: RabbitMode): string =>
+      mode === "auto" ? "Smart Auto" : mode === "manual" ? "Fixed Threshold" : mode === "garden" ? "Garden" : mode === "observe" ? "Observe" : "Off";
+    const readDurable = (): void => {
+      durableLoaded = true;
+      const override = typeof process !== "undefined" ? process.env.RABBIT_CONFIG_PATH : undefined;
+      const resolved = override && override.length > 0 ? override : globalConfigPath();
+      durablePath = resolved;
+      durable = loadFileConfig(resolved).config;
+      try {
+        durablePresent = fs.statSync(resolved).isFile();
+      } catch {
+        durablePresent = false;
+      }
+    };
+    const saveDurableFromState = (): void => {
+      try {
+        if (!durableLoaded) readDurable();
+        durable = validateFileConfig({
+          ...durable,
+          mode: state.mode,
+          fixedThresholdPercent: state.config.thresholdOverride ?? durable.fixedThresholdPercent,
+          hysteresisPercent: state.config.hysteresisPercent,
+        });
+        saveFileConfig(durable, durablePath || undefined);
+        durablePresent = true;
+      } catch {
+        // Durable persistence is best-effort; session state remains live.
+      }
+    };
+    const applyDurableConfig = (restored: PersistedState): PersistedState => {
+      if (!durableLoaded) readDurable();
+      if (durablePresent) {
+        return {
+          ...restored,
+          mode: durable.mode,
+          config: validateConfig({
+            ...restored.config,
+            thresholdOverride: durable.mode === "manual" ? durable.fixedThresholdPercent : null,
+            hysteresisPercent: durable.hysteresisPercent,
+          }),
+        };
+      }
+      durable = validateFileConfig({ ...durable, ...migrateSessionThreshold(restored) });
+      try {
+        saveFileConfig(durable, durablePath || undefined);
+        durablePresent = true;
+      } catch {
+        // Best-effort migration; session state remains live.
+      }
+      return restored;
+    };
+    const nativeKeepRecentTokens = (): number | undefined => {
+      try {
+        const settings = pi.getSettings() as { compaction?: { keepRecentTokens?: unknown } };
+        const value = settings.compaction?.keepRecentTokens;
+        return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const rabbitInstructions = (extra?: string): string =>
+      [RABBIT_COMPACTION_INSTRUCTIONS, presetInstructions(durable.preservation), state.config.customInstructions, extra]
+        .filter(Boolean)
+        .join("\n\n");
     const publish = (ctx: ExtensionContext) => {
       const currentUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
       if (currentUsage) latestUsage = currentUsage;
@@ -243,12 +327,11 @@ export function createRabbitExtension(): ExtensionFactory {
     const gardenInstructions = (request: GardenRequest) => {
       const unit = request.unitId ? gardenUnit(request.unitId) : undefined;
       return [
-        RABBIT_COMPACTION_INSTRUCTIONS,
+        rabbitInstructions(),
         "Garden decision: compact using Pi's native compaction path. Preserve the user's exact current intent and authority; current mission and phase; repository, branch, revision and evidence references; completed proof; unresolved questions and hypotheses; and the next gate. Keep concise receipts and references, not copied transcripts. Do not claim unresolved work is complete.",
         `Agent decision: ${request.decision}. Reason: ${request.reason}`,
         `Garden continuity units: ${JSON.stringify(state.gardenUnits ?? [])}`,
         unit ? `Focus on selected unit ${unit.id}: ${unit.summary}.` : "No single unit selected; preserve all recorded mission units.",
-        state.config.customInstructions,
       ].filter(Boolean).join("\n\n");
     };
     const gardenEvidenceSplit = (ctx: ExtensionContext, request: GardenRequest) => {
@@ -454,7 +537,11 @@ export function createRabbitExtension(): ExtensionFactory {
         return;
       }
       if (!state.armed) {
-        const rearmTokens = policy.targetTokens - Math.ceil((policy.effectiveBudget * state.config.hysteresisPercent) / 100);
+        // Smart Auto rearms below its pressure floor; Fixed Threshold rearms below its percentage. Both subtract hysteresis.
+        const floorTokens = state.mode === "auto"
+          ? Math.ceil((policy.effectiveBudget * SMART_AUTO_PRESSURE_FLOOR_PERCENT) / 100)
+          : policy.targetTokens;
+        const rearmTokens = floorTokens - Math.ceil((policy.effectiveBudget * state.config.hysteresisPercent) / 100);
         if (usage.tokens <= rearmTokens) {
           state = { ...state, armed: true, emergencyAttempted: false, emergencyRetryEligible: false };
           persist();
@@ -474,10 +561,30 @@ export function createRabbitExtension(): ExtensionFactory {
         }
       }
       const emergency = state.mode === "auto" && (crossedThreshold(previous, usage.tokens, policy.emergencyTokens) || (firstMeasurementForRoute && usage.tokens > policy.emergencyTokens));
-      const alreadyOverTrigger = firstMeasurementForRoute && usage.tokens > policy.targetTokens;
-      if (!crossedThreshold(previous, usage.tokens, policy.targetTokens) && !alreadyOverTrigger && !emergency) {
-        publish(ctx);
-        return;
+      if (state.mode === "auto" && !emergency) {
+        // Smart Auto: deterministic best-moment decision. No model calls, no
+        // invented task knowledge; the reason is stored for status and receipts.
+        const decision: SmartAutoDecision = decideSmartAuto({
+          percent: usage.percent,
+          tokens: usage.tokens,
+          effectiveBudget: policy.effectiveBudget,
+          growthPercentPerTurn: previous === undefined ? undefined : ((usage.tokens - previous) / policy.effectiveBudget) * 100,
+          keepRecentTokens: nativeKeepRecentTokens(),
+        });
+        state = { ...state, lastSmartReason: decision.reason };
+        if (!decision.shouldCompact) {
+          trace("threshold-decision", `smart auto waits: ${decision.reason}`, { tokens: usage.tokens, percent: usage.percent });
+          publish(ctx);
+          return;
+        }
+        trace("threshold-decision", `smart auto compacts: ${decision.reason}`, { tokens: usage.tokens, percent: usage.percent });
+      } else {
+        // Any non-auto mode reaching here needs an observed crossing of its fixed threshold.
+        const alreadyOverTrigger = firstMeasurementForRoute && usage.tokens > policy.targetTokens;
+        if (!crossedThreshold(previous, usage.tokens, policy.targetTokens) && !alreadyOverTrigger && !emergency) {
+          publish(ctx);
+          return;
+        }
       }
       if (typeof ctx.compact !== "function") {
         publish(ctx);
@@ -497,10 +604,7 @@ export function createRabbitExtension(): ExtensionFactory {
       publish(ctx);
       try {
         const autoStarted = dispatchNative(ctx, {
-          customInstructions: [
-            RABBIT_COMPACTION_INSTRUCTIONS,
-            state.config.customInstructions,
-          ].filter(Boolean).join("\n\n"),
+          customInstructions: rabbitInstructions(),
           onComplete: (result) => {
             compactionInFlight = false;
             if (!active || generation !== operationGeneration || sessionId !== operationSessionId) return;
@@ -520,7 +624,7 @@ export function createRabbitExtension(): ExtensionFactory {
               version: 1,
               trigger: state.mode,
               mode: state.mode,
-              reason: emergency ? "emergency" : "pressure",
+              reason: emergency ? "emergency" : state.mode === "auto" ? (state.lastSmartReason ?? "smart-auto") : "pressure",
               method: completedMethod,
               compactionNumber: ctx.sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === RECEIPT_ENTRY).length + 1,
               contextWindow: usage.contextWindow,
@@ -540,7 +644,10 @@ export function createRabbitExtension(): ExtensionFactory {
             });
             if (postCompactUsage) {
               latestUsage = postCompactUsage;
-              const rearmTokens = policy.targetTokens - Math.ceil((policy.effectiveBudget * state.config.hysteresisPercent) / 100);
+              const floorTokens = state.mode === "auto"
+                ? Math.ceil((policy.effectiveBudget * SMART_AUTO_PRESSURE_FLOOR_PERCENT) / 100)
+                : policy.targetTokens;
+              const rearmTokens = floorTokens - Math.ceil((policy.effectiveBudget * state.config.hysteresisPercent) / 100);
               if (postCompactUsage.tokens <= rearmTokens) {
                 state = { ...state, armed: true };
                 previousValidTokens = postCompactUsage.tokens;
@@ -604,8 +711,7 @@ export function createRabbitExtension(): ExtensionFactory {
       const operationSessionId = sessionId;
       try {
         const manualStarted = dispatchNative(ctx, {
-        customInstructions: [RABBIT_COMPACTION_INSTRUCTIONS, state.config.customInstructions]
-          .filter(Boolean).join("\n\n"),
+        customInstructions: rabbitInstructions(),
         onComplete: (result) => {
           compactionInFlight = false;
           if (generation !== operationGeneration || sessionId !== operationSessionId) return;
@@ -691,7 +797,7 @@ export function createRabbitExtension(): ExtensionFactory {
       active = true;
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
-      state = restore(ctx);
+      state = applyDurableConfig(restore(ctx));
       compactionInFlight = false;
       // Queued requests never survive a restart: they lacked fresh authorization.
       // In-flight requests receive an interruption receipt; queued ones a cancellation.
@@ -713,7 +819,7 @@ export function createRabbitExtension(): ExtensionFactory {
       compactionInFlight = false;
       context = ctx;
       sessionId = ctx.sessionManager.getSessionId();
-      state = restore(ctx);
+      state = applyDurableConfig(restore(ctx));
       if (state.pendingGardenRequest) invalidatePendingGardenRequest(ctx, state.pendingGardenRequest.status === "in-flight"
         ? "Garden compaction was interrupted by a session tree change."
         : "Queued Garden request was cancelled by a session tree change; request fresh authorization.");
@@ -908,35 +1014,139 @@ export function createRabbitExtension(): ExtensionFactory {
         }
       },
     });
+    // Shared settings actions (Milestone A): one code path for the interactive
+    // menu and the text commands, so both apply and persist identically.
+    const lastReceiptMethod = (cmdCtx: ExtensionCommandContext): string => {
+      try {
+        const last = [...cmdCtx.sessionManager.getBranch()].reverse().find((entry) =>
+          entry.type === "custom" && entry.customType === RECEIPT_ENTRY,
+        );
+        return last?.type === "custom" ? (last.data as { method?: string }).method ?? "unknown" : "unknown";
+      } catch {
+        return "unknown";
+      }
+    };
+    const statusSummary = (cmdCtx: ExtensionCommandContext): string => {
+      const currentUsage = readUsage(cmdCtx, outputReserveTokens(pi, cmdCtx));
+      if (currentUsage) latestUsage = currentUsage;
+      const usage = currentUsage ?? latestUsage;
+      const policy = resolvePolicy(usage?.contextWindow, state.config, usage?.reserveTokens);
+      const trigger = state.mode === "auto"
+        ? `Smart Auto: compacts when pressure is high enough AND savings are worthwhile AND context is growing fast (floor ${SMART_AUTO_PRESSURE_FLOOR_PERCENT}%)${state.lastSmartReason ? `; last check: ${state.lastSmartReason}` : ""}`
+        : state.mode === "manual"
+          ? `Fixed Threshold: compacts after crossing ${durable.fixedThresholdPercent}% of effective budget`
+          : state.mode === "garden"
+            ? "Garden: compacts only when directed as the agent (Pi overflow safety stays on)"
+            : state.mode === "observe"
+              ? "Observe: never compacts (Pi overflow safety stays on)"
+              : "Off: no Rabbit compaction (Pi overflow safety stays on)";
+      return [
+        "RABBIT PI COMPACTOR",
+        `mode: ${humanModeName(state.mode)}`,
+        `model: ${cmdCtx.model ? `${cmdCtx.model.provider}/${cmdCtx.model.id}` : "unknown"}`,
+        `context: ${currentUsage && policy ? `${currentUsage.tokens.toLocaleString()} / ${policy.effectiveBudget.toLocaleString()} effective (${currentUsage.percent.toFixed(1)}%)` : usage ? `unknown; last observed ${usage.percent.toFixed(1)}%` : "unknown"}`,
+        `trigger: ${trigger}`,
+        `keeps: ${PRESET_LABELS[durable.preservation]} (Rabbit-requested compactions only)`,
+        `state: ${compactionInFlight ? "compacting" : state.armed ? "armed" : "waiting for usage to drop before re-arming"}`,
+        `last compact: ${state.lastCompactionAt ?? "never"}`,
+        `garden units: ${state.gardenUnits?.length ?? 0}; pending: ${state.pendingGardenRequest?.decision ?? "none"}`,
+        `method: ${lastReceiptMethod(cmdCtx)}`,
+        ...(state.lastEstimatedTokensAfter !== undefined ? [`Pi estimated after: ${state.lastEstimatedTokensAfter.toLocaleString()} tokens`] : []),
+        ...(state.lastError ? [`last error: ${classifyFailure(state.lastError)}`] : []),
+      ].join("\n");
+    };
+    const advancedSummary = (cmdCtx: ExtensionCommandContext): string => {
+      let native = "unavailable";
+      try {
+        const settings = pi.getSettings() as { compaction?: { enabled?: unknown; reserveTokens?: unknown; keepRecentTokens?: unknown } };
+        native = `enabled=${String(settings.compaction?.enabled ?? "unknown")}, reserve=${String(settings.compaction?.reserveTokens ?? "unknown")}, keepRecent=${String(settings.compaction?.keepRecentTokens ?? "unknown")} (read-only: Pi owns these)`;
+      } catch {
+        native = "unavailable";
+      }
+      return [
+        "RABBIT ADVANCED",
+        `Pi native compaction: ${native}`,
+        `re-compact delay: ${state.config.hysteresisPercent}% of budget`,
+        `preservation preset: ${PRESET_LABELS[durable.preservation]}`,
+        `config file: ${durablePath || "(not loaded yet)"}`,
+      ].join("\n");
+    };
+    const applyMode = (cmdCtx: ExtensionCommandContext, value: RabbitMode): string => {
+      const previousMode = state.mode;
+      const leavingGarden = state.mode === "garden" && value !== "garden";
+      state = {
+        ...state,
+        mode: value,
+        config: value === "auto"
+          ? validateConfig({ ...state.config, thresholdOverride: null })
+          : value === "manual" && state.config.thresholdOverride === null
+            ? validateConfig({ ...state.config, thresholdOverride: durable.fixedThresholdPercent })
+            : state.config,
+      };
+      if (leavingGarden && state.pendingGardenRequest) {
+        generation += 1;
+        invalidatePendingGardenRequest(cmdCtx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
+      }
+      needsPressureCheck = value !== "off";
+      persist();
+      publish(cmdCtx);
+      trace("mode-transition", `${previousMode} -> ${value}`);
+      return `Rabbit is now ${humanModeName(value)}${value === "manual" ? ` (fixed ${durable.fixedThresholdPercent}%)` : ""}. Saved and kept across restarts.`;
+    };
+    const applyFixedThreshold = (cmdCtx: ExtensionCommandContext, percent: number): string => {
+      const thresholdPreviousMode = state.mode;
+      state = { ...state, mode: "manual", config: validateConfig({ ...state.config, thresholdOverride: percent }) };
+      if (thresholdPreviousMode === "garden" && state.pendingGardenRequest) {
+        generation += 1;
+        invalidatePendingGardenRequest(cmdCtx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
+      }
+      previousValidTokens = readUsage(cmdCtx, outputReserveTokens(pi, cmdCtx))?.tokens;
+      needsPressureCheck = true;
+      persist();
+      publish(cmdCtx);
+      trace("mode-transition", `threshold ${thresholdPreviousMode} -> manual`);
+      return `Fixed Threshold set to ${percent}%. Rabbit compacts after crossing it. Saved and kept across restarts.`;
+    };
+    const applyPreservation = (cmdCtx: ExtensionCommandContext, preset: PreservationPreset): string => {
+      if (!durableLoaded) readDurable();
+      durable = validateFileConfig({ ...durable, preservation: preset });
+      saveDurableFromState();
+      publish(cmdCtx);
+      return `Summaries will now keep: ${PRESET_LABELS[preset]}. Applies to Rabbit-requested compactions; Pi's own overflow compaction is unchanged.`;
+    };
+    const menuDeps = (cmdCtx: ExtensionCommandContext) => ({
+      getConfig: () => {
+        if (!durableLoaded) readDurable();
+        return durable;
+      },
+      getStatusText: () => statusSummary(cmdCtx),
+      getAdvancedText: () => advancedSummary(cmdCtx),
+      setMode: (mode: RabbitMode) => applyMode(cmdCtx, mode),
+      setFixedThreshold: (percent: number) => applyFixedThreshold(cmdCtx, percent),
+      setPreservation: (preset: PreservationPreset) => applyPreservation(cmdCtx, preset),
+      setHysteresis: (percent: number) => {
+        state = { ...state, config: validateConfig({ ...state.config, hysteresisPercent: percent }) };
+        persist();
+        publish(cmdCtx);
+        return `Re-compact delay set to ${percent}% of budget. Saved and kept across restarts.`;
+      },
+      compactNow: () => {
+        manualCompact(cmdCtx);
+        return "Manual compaction requested; Rabbit status shows the outcome.";
+      },
+    });
     pi.registerCommand("rabbit", {
       description: "Inspect and configure Rabbit Pi Compactor and Garden mode",
       handler: async (args, ctx) => {
         context = ctx;
         const [requestedOperation, value, extra] = args.trim().split(/\s+/, 3);
-        const operation = requestedOperation || "status";
+        const operation = requestedOperation || "menu";
+        if (operation === "menu" || operation === "settings") {
+          await openRabbitMenu(ctx, menuDeps(ctx));
+          return;
+        }
         if (operation === "status") {
-          const currentUsage = readUsage(ctx, outputReserveTokens(pi, ctx));
-          if (currentUsage) latestUsage = currentUsage;
-          const usage = currentUsage ?? latestUsage;
-          const policy = resolvePolicy(usage?.contextWindow, state.config, usage?.reserveTokens);
-          const lastReceipt = [...ctx.sessionManager.getBranch()].reverse().find((entry) =>
-            entry.type === "custom" && entry.customType === RECEIPT_ENTRY,
-          );
-          ctx.ui.notify([
-            "RABBIT PI COMPACTOR",
-            `mode: ${state.mode}`,
-            `model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown"}`,
-            `context: ${currentUsage && policy ? `${currentUsage.tokens.toLocaleString()} / ${policy.effectiveBudget.toLocaleString()} effective (${currentUsage.percent.toFixed(1)}%); window ${currentUsage.contextWindow.toLocaleString()}, output reserve ${policy.reserveTokens.toLocaleString()}` : usage ? `unknown; last observed ${usage.percent.toFixed(1)}% effective` : "unknown"}`,
-            `trigger: ${state.mode === "garden" ? "agent-directed (Pi overflow safety active)" : state.mode === "observe" ? "observe (never compacts; Pi overflow safety active)" : policy ? `${policy.targetPercent.toFixed(1)}% (${policy.band})` : "waiting for context usage"}`,
-            `emergency guard: ${state.mode === "garden" ? "Pi native overflow safety" : policy ? `${policy.emergencyPercent}%` : "unavailable"}`,
-            `state: ${compactionInFlight ? "compacting" : state.mode === "garden" ? "awaiting agent decision" : state.armed ? "armed" : "hysteresis"}`,
-            `compactions: ${ctx.sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === RECEIPT_ENTRY).length}`,
-            `garden units: ${state.gardenUnits?.length ?? 0}; pending: ${state.pendingGardenRequest?.decision ?? "none"}`,
-            `method: ${lastReceipt?.type === "custom" ? (lastReceipt.data as { method?: string }).method ?? "unknown" : "unknown"}`,
-            `last compact: ${state.lastCompactionAt ?? "never"}`,
-            ...(state.lastEstimatedTokensAfter !== undefined ? [`Pi estimated after: ${state.lastEstimatedTokensAfter.toLocaleString()} tokens`] : []),
-            ...(state.lastError ? [`last error: ${classifyFailure(state.lastError)}`] : []),
-          ].join("\n"), "info");
+          ctx.ui.notify(statusSummary(ctx), "info");
           return;
         }
         if (operation === "on" || operation === "off") {
@@ -974,56 +1184,34 @@ export function createRabbitExtension(): ExtensionFactory {
           return;
         }
         if (operation === "mode") {
-          if (value !== "auto" && value !== "manual" && value !== "off" && value !== "garden" && value !== "observe") {
-            ctx.ui.notify("Usage: /rabbit mode auto|manual|off|garden|observe", "warning");
+          const modeValue = value === "smart" || value === "smart-auto" ? "auto" : value === "fixed" || value === "fixed-threshold" ? "manual" : value;
+          if (modeValue !== "auto" && modeValue !== "manual" && modeValue !== "off" && modeValue !== "garden" && modeValue !== "observe") {
+            ctx.ui.notify("Usage: /rabbit mode smart-auto|fixed|garden|observe|off (auto|manual still work)", "warning");
             return;
           }
-          const previousMode = state.mode;
-          const leavingGarden = state.mode === "garden" && value !== "garden";
-          state = {
-            ...state,
-            mode: value as RabbitMode,
-            config: value === "auto"
-              ? validateConfig({ ...state.config, thresholdOverride: null })
-              : value === "manual" && state.config.thresholdOverride === null
-                ? validateConfig({ ...state.config, thresholdOverride: DEFAULT_MANUAL_TRIGGER_PERCENT })
-                : state.config,
-          };
-          if (leavingGarden && state.pendingGardenRequest) {
-            // Bump generation so any late callback for the abandoned request can
-            // never mutate the new mode/session; the request itself is receipted.
-            generation += 1;
-            invalidatePendingGardenRequest(ctx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
-          }
-          needsPressureCheck = value !== "off";
-          persist();
-          publish(ctx);
-          ctx.ui.notify(`Rabbit mode set to ${value}.`, "info");
-          trace("mode-transition", `${previousMode} -> ${value}`);
+          ctx.ui.notify(applyMode(ctx, modeValue as RabbitMode), "info");
           return;
         }
         if (operation === "threshold") {
           try {
-            const thresholdOverride = value === "adaptive" ? null : Number(value);
-            const thresholdPreviousMode = state.mode;
-            state = { ...state, mode: value === "adaptive" ? "auto" : "manual", config: validateConfig({ ...state.config, thresholdOverride }) };
-            if (thresholdPreviousMode === "garden" && state.pendingGardenRequest) {
-              // Same guarantee as /rabbit mode: leaving Garden never carries a queued request.
-              generation += 1;
-              invalidatePendingGardenRequest(ctx, "Queued Garden request was cancelled by leaving Garden mode; request fresh authorization.");
+            if (value === "adaptive") {
+              ctx.ui.notify(applyMode(ctx, "auto"), "info");
+            } else {
+              const percent = Number(value);
+              if (!Number.isSafeInteger(percent) || percent < 1 || percent > 99) throw new Error("threshold must be a whole percentage from 1 to 99.");
+              ctx.ui.notify(applyFixedThreshold(ctx, percent), "info");
             }
-            trace("mode-transition", `threshold ${thresholdPreviousMode} -> ${state.mode}`);
-            previousValidTokens = readUsage(ctx, outputReserveTokens(pi, ctx))?.tokens;
-            needsPressureCheck = value !== "adaptive";
-            persist();
-            publish(ctx);
-            ctx.ui.notify(
-              value === "adaptive" ? "Rabbit is using the adaptive threshold." : `Rabbit threshold set to ${thresholdOverride}%.`,
-              "info",
-            );
           } catch (error) {
             ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
           }
+          return;
+        }
+        if (operation === "preserve") {
+          if (value !== "balanced" && value !== "continuity" && value !== "technical") {
+            ctx.ui.notify("Usage: /rabbit preserve balanced|continuity|technical", "warning");
+            return;
+          }
+          ctx.ui.notify(applyPreservation(ctx, value), "info");
           return;
         }
         if (operation === "doctor") {
@@ -1141,7 +1329,7 @@ export function createRabbitExtension(): ExtensionFactory {
           ctx.ui.notify("Usage: /rabbit trace on|off|export [name]", "warning");
           return;
         }
-        ctx.ui.notify("Usage: /rabbit status|mode auto|manual|off|garden|observe|on|off|compact|cancel|threshold <1-99|adaptive>|doctor|trace on|off|export [path]", "warning");
+        ctx.ui.notify("Usage: /rabbit menu|settings|status|mode smart-auto|fixed|garden|observe|off|on|off|compact|cancel|threshold <1-99|adaptive>|preserve balanced|continuity|technical|doctor|trace on|off|export [name]", "warning");
       },
     });
   };

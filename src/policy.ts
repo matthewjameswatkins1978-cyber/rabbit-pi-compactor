@@ -22,6 +22,14 @@ export const DEFAULT_OUTPUT_RESERVE_TOKENS = 16_384;
 export const AUTO_TRIGGER_PERCENT = 88;
 export const DEFAULT_MANUAL_TRIGGER_PERCENT = 90;
 export const EMERGENCY_GUARD_PERCENT = 96;
+// Smart Auto gates (0.3.0): pressure floor, high-pressure fast path, minimum
+// worthwhile savings, and growth trigger. Deterministic; no model calls.
+export const SMART_AUTO_PRESSURE_FLOOR_PERCENT = 60;
+export const SMART_AUTO_HIGH_PRESSURE_PERCENT = 75;
+export const SMART_AUTO_MIN_SAVINGS_PERCENT = 10;
+export const SMART_AUTO_MIN_SAVINGS_TOKENS = 15_000;
+export const SMART_AUTO_GROWTH_TRIGGER_PERCENT = 2;
+export const SMART_AUTO_SUMMARY_OVERHEAD_TOKENS = 4_000;
 
 export const DEFAULT_CONFIG: RabbitConfig = {
   thresholdOverride: null,
@@ -77,4 +85,61 @@ export function crossedThreshold(
   thresholdTokens: number,
 ): boolean {
   return previousTokens !== undefined && previousTokens <= thresholdTokens && currentTokens > thresholdTokens;
+}
+
+export interface SmartAutoSignals {
+  readonly percent: number;
+  readonly tokens: number;
+  readonly effectiveBudget: number;
+  /** Per-turn growth as percent of effective budget (current minus previous valid). */
+  readonly growthPercentPerTurn: number | undefined;
+  /** Pi native keepRecentTokens when readable from settings; undefined means unknown. */
+  readonly keepRecentTokens: number | undefined;
+}
+
+export interface SmartAutoDecision {
+  readonly shouldCompact: boolean;
+  readonly reason: string;
+}
+
+/**
+ * Deterministic Smart Auto decision. No model calls, no invented task knowledge.
+ *
+ * Compact when pressure is above the floor AND the estimated savings are
+ * worthwhile AND (pressure is high OR context is growing fast). Below the
+ * high-pressure mark with unknown retention, pressure alone is not enough:
+ * the fallback requires high pressure and says so in the reason.
+ */
+export function decideSmartAuto(signals: SmartAutoSignals): SmartAutoDecision {
+  const { percent, tokens, effectiveBudget, growthPercentPerTurn, keepRecentTokens } = signals;
+  const floor = SMART_AUTO_PRESSURE_FLOOR_PERCENT;
+  const high = SMART_AUTO_HIGH_PRESSURE_PERCENT;
+  if (!Number.isFinite(percent) || !Number.isSafeInteger(tokens) || !Number.isSafeInteger(effectiveBudget) || effectiveBudget <= 0) {
+    return { shouldCompact: false, reason: "usage unknown; Smart Auto never triggers without a measurement" };
+  }
+  if (percent < floor) {
+    return { shouldCompact: false, reason: `pressure ${percent.toFixed(1)}% below Smart Auto floor ${floor}%` };
+  }
+  if (keepRecentTokens === undefined) {
+    if (percent >= high) {
+      return { shouldCompact: true, reason: `pressure ${percent.toFixed(1)}% at or above ${high}% (retention unknown; percent-only fallback)` };
+    }
+    return { shouldCompact: false, reason: `retention unknown and pressure ${percent.toFixed(1)}% below ${high}% fallback mark` };
+  }
+  const savings = tokens - keepRecentTokens - SMART_AUTO_SUMMARY_OVERHEAD_TOKENS;
+  const savingsPercent = (savings / effectiveBudget) * 100;
+  const minSavings = Math.max(
+    Math.ceil((effectiveBudget * SMART_AUTO_MIN_SAVINGS_PERCENT) / 100),
+    SMART_AUTO_MIN_SAVINGS_TOKENS,
+  );
+  if (savings < minSavings) {
+    return { shouldCompact: false, reason: `estimated savings ${Math.max(0, savings).toLocaleString()} tokens below ${minSavings.toLocaleString()} minimum` };
+  }
+  if (percent >= high) {
+    return { shouldCompact: true, reason: `pressure ${percent.toFixed(1)}% at or above ${high}%; savings ~${savingsPercent.toFixed(0)}% of budget` };
+  }
+  if (growthPercentPerTurn !== undefined && growthPercentPerTurn >= SMART_AUTO_GROWTH_TRIGGER_PERCENT) {
+    return { shouldCompact: true, reason: `pressure ${percent.toFixed(1)}% with growth +${growthPercentPerTurn.toFixed(1)}%/turn; savings ~${savingsPercent.toFixed(0)}% of budget` };
+  }
+  return { shouldCompact: false, reason: `pressure ${percent.toFixed(1)}% holding below ${high}% with growth ${growthPercentPerTurn === undefined ? "unknown" : `+${growthPercentPerTurn.toFixed(1)}%/turn`} below +${SMART_AUTO_GROWTH_TRIGGER_PERCENT}%/turn` };
 }
