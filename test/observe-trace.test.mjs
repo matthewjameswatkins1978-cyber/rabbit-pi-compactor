@@ -145,6 +145,10 @@ test("/rabbit doctor reports sanitised observed/estimated/inferred/missing secti
   }
   assert.ok(Array.isArray(payload.safety) && payload.safety.length > 0);
   assert.ok(!/api[_-]?key|secret|credential|prompt/i.test(output), "doctor output carries no secrets or prompts");
+  await h.command("mode smart-auto");
+  await h.command("doctor");
+  const smart = JSON.parse(h.notices.at(-1).slice(h.notices.at(-1).indexOf("\n") + 1));
+  assert.match(smart.inferred.trigger, /smart auto/, "doctor describes the Smart Auto gates, not a fixed percentage");
 });
 
 test("/rabbit trace captures pressure and exports a bounded sanitised report to a file", async () => {

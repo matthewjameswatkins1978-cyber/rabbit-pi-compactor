@@ -1241,7 +1241,7 @@ export function createRabbitExtension(): ExtensionFactory {
               lastEstimatedTokensAfter: state.lastEstimatedTokensAfter ?? null,
             },
             inferred: {
-              trigger: state.mode === "observe" || state.mode === "garden" ? "agent-directed or none (Pi overflow safety active)" : policy ? `${policy.targetPercent}% of effective budget` : "waiting for first measurement",
+              trigger: state.mode === "observe" || state.mode === "garden" ? "agent-directed or none (Pi overflow safety active)" : state.mode === "auto" ? `smart auto: ${SMART_AUTO_PRESSURE_FLOOR_PERCENT}% floor + savings + growth gates${state.lastSmartReason ? `; last check: ${state.lastSmartReason}` : ""}` : state.mode === "manual" ? `fixed ${durable.fixedThresholdPercent}% of effective budget` : policy ? `${policy.targetPercent}% (${policy.band})` : "waiting for first measurement",
               rearm: state.armed ? "armed" : "hysteresis until usage recovers",
             },
             missing: [
