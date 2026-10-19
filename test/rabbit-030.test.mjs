@@ -176,6 +176,22 @@ test("migration seeds the file from a 0.2.3 session threshold once", () => {
 
 // --- Menu navigation and cancellation ---
 
+test("a corrupt config file never overrides live session state and is repaired", () => {
+  const h = harness(100_000);
+  fs.writeFileSync(process.env.RABBIT_CONFIG_PATH, "{not valid json");
+  h.entries.push({
+    type: "custom",
+    customType: "rabbit-pi-compactor-state-v1",
+    data: { kind: "rabbit-state", mode: "manual", config: { thresholdOverride: 75, hysteresisPercent: 5, customInstructions: "" }, armed: true },
+  });
+  h.emit("session_start");
+  h.setUsage(800_000);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1, "live manual/75 survives the corrupt file");
+  assert.equal(h.readFile().mode, "manual");
+  assert.equal(h.readFile().fixedThresholdPercent, 75, "repair preserves the live threshold, not defaults");
+});
+
 test("menu changes preservation through keyboard selection", async () => {
   const h = harness(100_000, 1_000_000, { script: [2, 1, 6] });
   h.emit("session_start");

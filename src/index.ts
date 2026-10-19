@@ -1,7 +1,7 @@
 export { classifyFailure, createRabbitExtension, RABBIT_VERSION, RECEIPT_ENTRY, STATE_ENTRY, TRACE_EXPORT_ENTRY } from "./extension.js";
 export type { RabbitFailureCode } from "./extension.js";
 export { DEFAULT_FILE_CONFIG, DEFAULT_FIXED_THRESHOLD_PERCENT, RABBIT_FILE_CONFIG_VERSION, globalConfigPath, loadFileConfig, migrateSessionThreshold, saveFileConfig, toSessionConfig, validateFileConfig } from "./config.js";
-export type { PreservationPreset, RabbitFileConfig } from "./config.js";
+export type { LoadedFileConfig, PreservationPreset, RabbitFileConfig } from "./config.js";
 export { PRESET_INSTRUCTIONS, PRESET_LABELS, presetInstructions } from "./presets.js";
 export { GARDEN_RECEIPT_ENTRY, isPiEntryReference, splitEvidenceReferences, validateEvidenceReferences } from "./garden.js";
 export { RABBIT_COMPACTION_INSTRUCTIONS } from "./instructions.js";

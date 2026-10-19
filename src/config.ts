@@ -57,17 +57,24 @@ export function validateFileConfig(input: unknown): RabbitFileConfig {
   return { version: 1, mode, fixedThresholdPercent: fixed, preservation, hysteresisPercent: hysteresis };
 }
 
-export function loadFileConfig(configPath?: string): { config: RabbitFileConfig; path: string; migrated: boolean } {
+export interface LoadedFileConfig {
+  readonly config: RabbitFileConfig;
+  readonly path: string;
+  /** True only when a valid file was read. Missing or corrupt files report false, so live session state wins and repairs the file on the next persist. */
+  readonly present: boolean;
+}
+
+export function loadFileConfig(configPath?: string): LoadedFileConfig {
   const resolved = configPath ?? globalConfigPath();
   try {
     const text = fs.readFileSync(resolved, "utf8");
-    return { config: validateFileConfig(JSON.parse(text)), path: resolved, migrated: false };
+    return { config: validateFileConfig(JSON.parse(text)), path: resolved, present: true };
   } catch (error) {
     if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { config: { ...DEFAULT_FILE_CONFIG }, path: resolved, migrated: false };
+      return { config: { ...DEFAULT_FILE_CONFIG }, path: resolved, present: false };
     }
-    // Corrupt config never breaks startup: fall back to defaults.
-    return { config: { ...DEFAULT_FILE_CONFIG }, path: resolved, migrated: false };
+    // Corrupt config never breaks startup and never overrides live state.
+    return { config: { ...DEFAULT_FILE_CONFIG }, path: resolved, present: false };
   }
 }
 

@@ -239,12 +239,9 @@ export function createRabbitExtension(): ExtensionFactory {
       const override = typeof process !== "undefined" ? process.env.RABBIT_CONFIG_PATH : undefined;
       const resolved = override && override.length > 0 ? override : globalConfigPath();
       durablePath = resolved;
-      durable = loadFileConfig(resolved).config;
-      try {
-        durablePresent = fs.statSync(resolved).isFile();
-      } catch {
-        durablePresent = false;
-      }
+      const loaded = loadFileConfig(resolved);
+      durable = loaded.config;
+      durablePresent = loaded.present;
     };
     const saveDurableFromState = (): void => {
       try {
