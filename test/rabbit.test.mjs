@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   createRabbitExtension,
   crossedThreshold,
@@ -11,6 +14,8 @@ import {
 import { serializeConversation } from "@earendil-works/pi-coding-agent";
 
 function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
+  // Isolate the durable file config per harness: never touch the real user config.
+  process.env.RABBIT_CONFIG_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rabbit-test-")), "rabbit.json");
   const handlers = new Map();
   const commands = new Map();
   const tools = new Map();
@@ -89,59 +94,56 @@ test("output reserve reduces usable capacity without changing Pi retention setti
   assert.equal(policy.reserveTokens, 20_000);
 });
 
-test("threshold crossing compacts once, receipts the result, and rearms below hysteresis", () => {
-  const target = Math.ceil((1_000_000 - 16_384) * 0.88);
+test("smart auto compacts once at a worthwhile moment and rearms below floor hysteresis", () => {
   const h = harness(340_000);
   h.emit("session_start");
-  h.setUsage(target);
+  h.setUsage(500_000);
   h.emit("turn_end");
-  assert.equal(h.compactCalls.length, 0, "exact threshold is not above it");
-  h.setUsage(target + 1);
+  assert.equal(h.compactCalls.length, 0, "below the Smart Auto floor Rabbit waits");
+  h.setUsage(800_000);
   h.emit("turn_end");
   assert.equal(h.compactCalls.length, 1);
   assert.equal("keepRecentTokens" in h.compactCalls[0], false, "Pi remains the owner of recent-tail retention");
-  h.setUsage(target + 10_000);
+  h.setUsage(810_000);
   h.emit("turn_end");
   assert.equal(h.compactCalls.length, 1, "staying above must not repeat");
-  h.setUsage(28_000);
   h.emit("session_compact");
-  h.compactCalls[0].onComplete({ estimatedTokensAfter: 28_000 });
+  h.compactCalls[0].onComplete({ estimatedTokensAfter: 300_000 });
   const receipt = h.entries.find((entry) => entry.customType === RECEIPT_ENTRY)?.data;
   assert.equal(receipt.trigger, "auto");
   assert.equal(receipt.method, "pi-local");
   assert.equal(receipt.compactionNumber, 1);
   assert.equal(receipt.effectiveBudget, 983_616);
   assert.equal(receipt.outputReserveTokens, 16_384);
-  assert.equal(receipt.estimatedTokensAfter, 28_000);
-  assert.equal(receipt.afterTokens, 28_000);
+  assert.equal(receipt.estimatedTokensAfter, 300_000);
+  assert.equal(receipt.afterTokens, 810_000);
   assert.equal(receipt.mode, "auto");
-  h.setUsage(target - Math.ceil(983_616 * 0.05) - 1);
+  assert.match(receipt.reason, /81\.3%/);
+  h.setUsage(600_000);
   h.emit("turn_end");
-  h.setUsage(target);
+  h.setUsage(800_000);
   h.emit("turn_end");
-  h.setUsage(target + 1);
+  assert.equal(h.compactCalls.length, 1, "no rearm above the floor-hysteresis line");
+  h.setUsage(500_000);
   h.emit("turn_end");
-  assert.equal(h.compactCalls.length, 2, "rearms below 30%, then requires a new crossing");
+  h.setUsage(800_000);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 2, "rearms below the line, then compacts once more");
 });
 
 test("Rabbit supports at least three compactions in one run", () => {
-  const target = Math.ceil((1_000_000 - 16_384) * 0.88);
   const h = harness(300_000);
   h.emit("session_start");
   for (let number = 1; number <= 3; number += 1) {
-    h.setUsage(target);
-    h.emit("turn_end");
-    h.setUsage(target + 1);
+    h.setUsage(800_000);
     h.emit("turn_end");
     const operation = h.compactCalls.at(-1);
     assert.ok(operation);
+    h.setUsage(30_000);
+    h.emit("session_compact");
     operation.onComplete({ estimatedTokensAfter: 30_000 });
     const receipts = h.entries.filter((entry) => entry.customType === RECEIPT_ENTRY);
     assert.equal(receipts.at(-1).data.compactionNumber, number);
-    if (number < 3) {
-      h.setUsage(target - Math.ceil(983_616 * 0.05) - 1);
-      h.emit("turn_end");
-    }
   }
   assert.equal(h.compactCalls.length, 3);
 });
@@ -231,13 +233,12 @@ test("model-specific output reserve override is used for the selected route", ()
   const h = harness(60_000, 100_000);
   h.setSettings({ compaction: { reserveTokens: 16_384, modelOverrides: { "meta/muse-spark-1.3-contributor": { reserveTokens: 20_000 } } } });
   h.emit("session_start");
-  const target = Math.ceil(80_000 * 0.88);
-  h.setUsage(target, 100_000);
+  h.setUsage(50_000, 100_000);
   h.emit("turn_end");
-  assert.equal(h.compactCalls.length, 0);
-  h.setUsage(target + 1, 100_000);
+  assert.equal(h.compactCalls.length, 0, "62.5% with unknown retention is below the fallback mark");
+  h.setUsage(70_400, 100_000);
   h.emit("turn_end");
-  assert.equal(h.compactCalls.length, 1);
+  assert.equal(h.compactCalls.length, 1, "88% compacts through the percent-only fallback");
   h.setUsage(20_000, 100_000);
   h.emit("session_compact");
   h.compactCalls[0].onComplete({ estimatedTokensAfter: 20_000 });
@@ -263,20 +264,24 @@ test("provider quota percentage is ignored by context pressure calculations", ()
 });
 
 test("mode Auto, Manual, and Off persist across session restart", () => {
+  const lastState = () => h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data;
   const h = harness(100_000);
   h.emit("session_start");
   h.commands.get("rabbit")("threshold 99", h.context);
-  assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data.mode, "manual");
+  assert.equal(lastState().mode, "manual");
+  assert.equal(lastState().config.thresholdOverride, 99);
   h.emit("session_shutdown");
   h.emit("session_start");
+  assert.equal(lastState().mode, "manual", "the durable file carries Fixed Threshold across restart");
+  assert.equal(lastState().config.thresholdOverride, 99);
   h.commands.get("rabbit")("off", h.context);
   h.emit("session_shutdown");
   h.emit("session_start");
-  assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data.mode, "off");
+  assert.equal(lastState().mode, "off");
   h.commands.get("rabbit")("mode auto", h.context);
-  assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data.mode, "auto");
+  assert.equal(lastState().mode, "auto");
   h.commands.get("rabbit")("mode manual", h.context);
-  assert.equal(h.entries.filter((entry) => entry.customType === "rabbit-pi-compactor-state-v1").at(-1).data.config.thresholdOverride, 90);
+  assert.equal(lastState().config.thresholdOverride, 99, "manual reuses the saved fixed threshold");
 });
 
 test("manual compaction writes a sequence receipt with measured before and after values", () => {
@@ -376,16 +381,21 @@ test("unavailable native compaction API fails safely", () => {
 test("failed compaction stays disarmed until safe rearm", () => {
   const h = harness(340_000);
   h.emit("session_start");
-  const target = Math.ceil((1_000_000 - 16_384) * 0.88);
-  h.setUsage(target + 1);
+  h.setUsage(800_000);
   h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1);
   h.compactCalls[0].onError(new Error("test failure"));
   h.setUsage(920_000);
   h.emit("turn_end");
   assert.equal(h.compactCalls.length, 1);
-  h.setUsage(target - Math.ceil(983_616 * 0.05) - 1);
+  h.setUsage(600_000);
   h.emit("turn_end");
-  h.setUsage(target + 1);
+  h.setUsage(800_000);
+  h.emit("turn_end");
+  assert.equal(h.compactCalls.length, 1, "61% is still above the 55% rearm line");
+  h.setUsage(500_000);
+  h.emit("turn_end");
+  h.setUsage(800_000);
   h.emit("turn_end");
   assert.equal(h.compactCalls.length, 2);
 });

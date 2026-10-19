@@ -1,7 +1,7 @@
 /**
  * Real Pi SDK lifecycle probe (isolated, disposable, no credentials).
  *
- * Drives the BUILT Rabbit extension through Pi 1.1.0's REAL extension
+ * Drives the BUILT Rabbit extension through Pi's REAL extension
  * loader (loadExtensionFromFactory), REAL event bus emission
  * (ExtensionRunner.emit: session_start / turn_end / session_shutdown),
  * REAL tool-context creation, and REAL SessionManager persistence in a
@@ -27,6 +27,8 @@ import { createRabbitExtension } from "../dist/index.js";
 
 const step = (n) => console.log(`[lifecycle] ${n}`);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rabbit-lifecycle-"));
+// Isolate the durable file config inside the probe dir: never touch the real user config.
+process.env.RABBIT_CONFIG_PATH = path.join(tmp, "rabbit.json");
 const sessionDir = path.join(tmp, "sessions");
 fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -91,6 +93,9 @@ assert.ok(rabbitCommand, "/rabbit command handler registered");
 const cmdCtx = runner.createCommandContext();
 await rabbitCommand.handler("mode garden", cmdCtx);
 step("2b. Garden mode enabled via the real registered /rabbit command");
+const durable030 = JSON.parse(fs.readFileSync(process.env.RABBIT_CONFIG_PATH, "utf8"));
+assert.equal(durable030.mode, "garden", "real /rabbit command persists the mode to the durable file");
+step("2c. durable file carries the commanded mode");
 
 const toolCtx = runner.createToolContext("call-1", undefined);
 const garden = ext.tools.get("rabbit_garden");

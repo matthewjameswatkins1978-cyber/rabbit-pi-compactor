@@ -4,7 +4,7 @@ An adaptive policy layer around Pi's native compactor. Rabbit schedules an early
 
 ## Compatibility
 
-- Pi SDK: **1.2.0** (extension API verified against the installed Pi 1.2.0 CLI)
+- Pi SDK: **1.2.0** (extension API; also loads under the installed Pi 1.3.0 CLI)
 - Gary Pi: loads Rabbit through Pi's native extension loader after Pi installs it to the shared user or project package settings.
 - Does not modify Pi's `reserveTokens` or replace the native compaction engine.
 
@@ -24,15 +24,23 @@ pi install git:github.com/matthewjameswatkins1978-cyber/rabbit-pi-compactor --lo
 
 Gary Pi reads those same Pi package settings. After installation, refresh or reload extensions in Gary Pi; Rabbit appears in the Extensions list, where it can be enabled or disabled. Rabbit uses the same Pi extension runtime and session history and does not maintain a parallel transcript.
 
+## Settings menu
+
+Type `/rabbit` (or `/rabbit settings`) to open an interactive settings menu built on Pi's native selectors: arrow keys, Enter to pick, Escape to leave without changing anything. Everyday controls are **when to compact** (Smart Auto / Fixed Threshold / Garden / Observe / Off), **what to keep** (Balanced / Project Continuity / Technical), **Compact now**, and **Status**. Advanced settings (Pi native details, re-compact delay) stay tucked away. Every visible setting applies immediately and persists. Without a terminal UI (headless/RPC), `/rabbit` prints text guidance and the `/rabbit mode|threshold|preserve` commands keep working.
+
+## Configuration file
+
+Global preferences live in one validated JSON file, `~/.pi/agent/rabbit.json` (`RABBIT_CONFIG_PATH` overrides it for tests): mode, fixed threshold, preservation preset, and re-compact delay. Settings survive closing and reopening Pi. Garden units, queued requests, and decision receipts stay per-session custom entries in Pi's session branch and never leak into the global file. A 0.2.3 session threshold is migrated into the file once, never overwritten afterwards: the file wins on restart. Rabbit never touches Pi's own settings, credentials, or package configuration.
+
 ## Adaptive policy
 
 Rabbit uses the active model's `contextWindow` and token count from Pi's `getContextUsage()` API. It does not infer capacity from model names.
 
-Auto triggers on a measured crossing of 88% of the active model's effective budget. After a failed normal attempt, the initial emergency guard permits one bounded retry at a crossing of 96%. These are operational starting points, not universal optima. The effective budget is the reported context window less Pi's configured output reserve (including the exact provider/model override, when present). The numerator is Pi's measured context token count, which already includes the serialized system prompt and conversation; Rabbit does not subtract system prompt, messages, or tool output again. The default reserve is 16,384 tokens when no valid Pi setting is available. Manual accepts a 1–99% trigger on that same effective budget, defaulting to 90% when Manual is selected without an explicit value. Trigger pressure is separate from retention: Pi continues to own its recent-message tail and summary cut point.
+Smart Auto compacts at a deterministic best moment, not a fixed percentage: pressure above a 60% floor AND worthwhile estimated savings AND (pressure at or above 75% OR context growing fast at +2%/turn or more). When Pi's recent-retention size is unknown, Smart Auto says so and uses a transparent percent-only fallback at 75%+. Every wait or fire carries a short human-readable reason shown in status and stored in the receipt. After a failed normal attempt, one bounded retry is permitted at the 96% emergency guard. These are operational starting points, not universal optima, and no extra model calls are made to decide. The effective budget is the reported context window less Pi's configured output reserve (including the exact provider/model override, when present). The numerator is Pi's measured context token count, which already includes the serialized system prompt and conversation; Rabbit does not subtract system prompt, messages, or tool output again. The default reserve is 16,384 tokens when no valid Pi setting is available. Manual accepts a 1–99% trigger on that same effective budget, defaulting to 90% when Manual is selected without an explicit value. Trigger pressure is separate from retention: Pi continues to own its recent-message tail and summary cut point.
 
-Choose a mode with `/rabbit mode auto|manual|off|garden|observe`. `observe` records pressure for diagnostics but never requests compaction. `/rabbit threshold 1-99` selects Manual with that threshold; `/rabbit threshold adaptive` returns to Auto. `/rabbit on` re-enables the last Auto or Manual configuration; `/rabbit off` selects Off. Mode and Manual threshold are persisted in the session's existing custom entries. A completed compaction discards the pre-compaction crossing baseline, reads Pi's current measurement again, records a receipt, and rearms only after measured usage is below the hysteresis boundary.
+Choose Smart Auto, Fixed Threshold, Garden, Observe, or Off with `/rabbit`, `/rabbit mode smart-auto|fixed|garden|observe|off` (`auto|manual` still work), or `/rabbit on|off`. Fixed Threshold accepts 1–99% (40% is the default example, adjustable in the menu or with `/rabbit threshold 40`); `/rabbit threshold adaptive` returns to Smart Auto. `observe` records pressure for diagnostics but never requests compaction. Modes, thresholds, presets, and delays persist to the configuration file. A completed compaction discards the pre-compaction baseline, reads Pi's current measurement again, records a receipt, and rearms only after measured usage drops below the Smart Auto floor (or the fixed mark) minus hysteresis.
 
-Rabbit requires an observed token-count crossing from at-or-below the exact trigger token to above it, then rearms after measured usage falls below the trigger by the configured hysteresis. It invokes `ctx.compact()` without awaiting it. Unknown (`null`) token usage never counts as zero and never triggers a compact. Auto uses one conservative model-relative rule across small and large windows; it does not claim to be an empirically optimal curve.
+Smart Auto fires at most once per arming: after a trigger it stays quiet until usage recovers below its floor minus hysteresis (Fixed Threshold rearms below its mark minus hysteresis). It invokes `ctx.compact()` without awaiting it. Unknown (`null`) token usage never counts as zero and never triggers a compact. The policy uses small deterministic signals only and never claims to know task completion.
 
 Pi's native safety/overflow compaction remains enabled and can run first. Rabbit observes those compactions and disarms until usage recovers below the hysteresis boundary.
 
@@ -50,11 +58,13 @@ Evidence references distinguish verified proof from pointers: only `pi-entry:<en
 
 ## Commands
 
-- `/rabbit status` — show mode, selected model, context use, output reserve, effective budget, trigger, armed state, sequence count, and method.
-- `/rabbit mode auto|manual|off|garden|observe` — select the operating mode (`observe` never requests compaction).
-- `/rabbit off` / `/rabbit on` — select Off or re-enable the prior Auto/Manual configuration.
-- `/rabbit threshold 90` — set a Manual trigger percentage from 1–99.
-- `/rabbit threshold adaptive` — restore Auto.
+- `/rabbit` or `/rabbit settings` — open the interactive settings menu (default when no command is given).
+- `/rabbit status` — show the mode in human language, selected model, context use, trigger with the last Smart Auto reason, preservation preset, armed state, sequence count, and method.
+- `/rabbit mode smart-auto|fixed|garden|observe|off` — select the operating mode (`auto|manual` still work; `observe` never requests compaction).
+- `/rabbit off` / `/rabbit on` — select Off or re-enable the prior Smart Auto/Fixed Threshold configuration.
+- `/rabbit threshold 40` — set a Fixed Threshold percentage from 1–99 (40 is the default example).
+- `/rabbit threshold adaptive` — return to Smart Auto.
+- `/rabbit preserve balanced|continuity|technical` — choose what Rabbit-requested summaries keep. Presets shape only Rabbit-requested native compactions; Pi's own overflow compaction is unchanged.
 - `/rabbit compact` — request Pi's native compactor manually.
 - `/rabbit cancel` — abandon a queued (not yet dispatched) Garden request with a truthful cancellation receipt.
 - `/rabbit doctor` — sanitised compatibility, state, policy and safety report, split into observed / estimated / inferred / missing sections.
