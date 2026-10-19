@@ -317,7 +317,9 @@ export function createRabbitExtension(): ExtensionFactory {
       else if (!currentUsage && state.lastError) label = `🐇 ${modeTag} · compact failed`;
       else if (!currentUsage && state.lastCompactionAt) label = `🐇 ${modeTag} · compacted${waiting}`;
       else if (usage && policy) {
-        label = `🐇 ${modeTag} ${Math.floor(usage.percent)}% → ${policy.targetPercent.toFixed(0)}%${waiting}`;
+        label = state.mode === "auto"
+          ? `🐇 auto ${Math.floor(usage.percent)}% · smart 60/75%${waiting}`
+          : `🐇 ${modeTag} ${Math.floor(usage.percent)}% → ${policy.targetPercent.toFixed(0)}%${waiting}`;
       } else if (state.lastCompactionAt) label = `🐇 ${modeTag} · compacted${waiting}`;
       try {
         ctx.ui.setStatus(STATUS_KEY, label);
@@ -599,7 +601,7 @@ export function createRabbitExtension(): ExtensionFactory {
         return;
       }
 
-      trace("threshold-decision", `${state.mode} crossed ${policy.targetPercent.toFixed(0)}% at ${usage.percent.toFixed(1)}%${emergency ? " (emergency)" : ""}; requesting native compaction`, { tokens: usage.tokens, percent: usage.percent });
+      trace("threshold-decision", state.mode === "auto" && !emergency ? `auto smart (${state.lastSmartReason ?? "gates passed"}) at ${usage.percent.toFixed(1)}%; requesting native compaction` : `${state.mode} crossed ${policy.targetPercent.toFixed(0)}% at ${usage.percent.toFixed(1)}%${emergency ? " (emergency)" : ""}; requesting native compaction`, { tokens: usage.tokens, percent: usage.percent });
       const operationGeneration = generation;
       const operationSessionId = sessionId;
       state = {
@@ -665,7 +667,9 @@ export function createRabbitExtension(): ExtensionFactory {
             publish(ctx);
             if (ctx.hasUI) {
               ctx.ui.notify(
-                `🐇 Compacted at ${usage.percent.toFixed(1)}% → ${policy.targetPercent.toFixed(1)}%${result.estimatedTokensAfter !== undefined ? ` (Pi estimate after: ${result.estimatedTokensAfter.toLocaleString()})` : ""}.`,
+                state.mode === "auto" && !emergency
+                  ? `🐇 Compacted at ${usage.percent.toFixed(1)}% (Smart Auto)${result.estimatedTokensAfter !== undefined ? ` (Pi estimate after: ${result.estimatedTokensAfter.toLocaleString()})` : ""}.`
+                  : `🐇 Compacted at ${usage.percent.toFixed(1)}% → ${policy.targetPercent.toFixed(1)}%${result.estimatedTokensAfter !== undefined ? ` (Pi estimate after: ${result.estimatedTokensAfter.toLocaleString()})` : ""}.`,
                 "info",
               );
             }
