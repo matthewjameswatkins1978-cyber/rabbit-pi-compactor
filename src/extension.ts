@@ -191,6 +191,11 @@ export function createRabbitExtension(): ExtensionFactory {
     // event do. A stuck guard fails closed (no new dispatch, never an overlap).
     interface NativeOp { readonly id: number; }
     let nativeOpCounter = 0;
+    // Status-bar hop frame. Incremented on every publish() so the rabbit
+    // visibly moves (trailing dots cycle) while compaction is running.
+    // No timers: Pi repaints on setStatus, and publish() runs on every
+    // turn_end / mode / compaction transition.
+    let statusTick = 0;
     let nativeOp: NativeOp | undefined;
     let nativeObserved = false;
     const dispatchNative = (ctx: ExtensionContext, options: CompactOptions): boolean => {
@@ -298,16 +303,22 @@ export function createRabbitExtension(): ExtensionFactory {
       if (currentUsage) latestUsage = currentUsage;
       const usage = currentUsage ?? latestUsage;
       const policy = resolvePolicy(usage?.contextWindow, state.config, usage?.reserveTokens);
-      let label = "🐇 waiting for context usage";
+      statusTick += 1;
+      // Short mode tag so the status bar always names the active setting.
+      const modeTag = state.mode === "auto" ? "auto" : state.mode === "manual" ? "fixed" : state.mode;
+      // Simplest motion: cycle trailing dots while work is running.
+      const hop = ".".repeat(1 + (statusTick % 3));
+      const waiting = !state.armed && !compactionInFlight ? " · waiting" : "";
+      let label = `🐇 ${modeTag} · waiting for context usage`;
       if (state.mode === "off") label = "🐇 off";
-      else if (compactionInFlight) label = "🐇 compacting…";
-      else if (state.mode === "garden") label = `🐇 garden · ${state.gardenUnits?.filter((unit) => unit.status !== "complete").length ?? 0} units`;
+      else if (compactionInFlight) label = `🐇${hop} compacting [${modeTag}]`;
+      else if (state.mode === "garden") label = `🐇 garden · ${state.gardenUnits?.filter((unit) => unit.status !== "complete").length ?? 0} units${waiting}`;
       else if (state.mode === "observe") label = "🐇 observe · never compacts";
-      else if (!currentUsage && state.lastError) label = "🐇 compact failed";
-      else if (!currentUsage && state.lastCompactionAt) label = "🐇 compacted";
+      else if (!currentUsage && state.lastError) label = `🐇 ${modeTag} · compact failed`;
+      else if (!currentUsage && state.lastCompactionAt) label = `🐇 ${modeTag} · compacted${waiting}`;
       else if (usage && policy) {
-        label = `🐇 ${Math.floor(usage.percent)}% → ${policy.targetPercent.toFixed(0)}%`;
-      } else if (state.lastCompactionAt) label = "🐇 compacted";
+        label = `🐇 ${modeTag} ${Math.floor(usage.percent)}% → ${policy.targetPercent.toFixed(0)}%${waiting}`;
+      } else if (state.lastCompactionAt) label = `🐇 ${modeTag} · compacted${waiting}`;
       try {
         ctx.ui.setStatus(STATUS_KEY, label);
       } catch {
