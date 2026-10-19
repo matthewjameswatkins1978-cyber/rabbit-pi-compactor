@@ -10,6 +10,8 @@ const GARDEN_RECEIPT = "rabbit-pi-compactor-garden-receipt-v1";
 const TRACE_EXPORT = "rabbit-pi-compactor-trace-export-v1";
 
 function harness(initialTokens = 300_000, contextWindow = 1_000_000, opts = {}) {
+  // Isolate the durable file config per harness: never touch the real user config.
+  process.env.RABBIT_CONFIG_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rabbit-test-")), "rabbit.json");
   const handlers = new Map();
   const commands = new Map();
   const tools = new Map();

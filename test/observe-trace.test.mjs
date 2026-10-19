@@ -10,6 +10,8 @@ const GARDEN_RECEIPT = "rabbit-pi-compactor-garden-receipt-v1";
 const TRACE_EXPORT = "rabbit-pi-compactor-trace-export-v1";
 
 function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
+  // Isolate the durable file config per harness: never touch the real user config.
+  process.env.RABBIT_CONFIG_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rabbit-test-")), "rabbit.json");
   const handlers = new Map();
   const commands = new Map();
   const tools = new Map();
@@ -136,7 +138,7 @@ test("/rabbit doctor reports sanitised observed/estimated/inferred/missing secti
   const output = h.notices.at(-1);
   assert.match(output, /RABBIT DOCTOR/);
   const payload = JSON.parse(output.slice(output.indexOf("\n") + 1));
-  assert.equal(payload.rabbit, "0.2.3");
+  assert.equal(payload.rabbit, "0.3.0");
   assert.equal(payload.observed.mode, "observe");
   for (const section of ["observed", "estimated", "inferred", "missing", "safety"]) {
     assert.ok(payload[section] !== undefined, `doctor section ${section} present`);
@@ -161,7 +163,7 @@ test("/rabbit trace captures pressure and exports a bounded sanitised report to 
   assert.ok(exported, "export persists a bounded session entry");
   assert.ok(exported.events.length <= 50, "persisted export entry is bounded");
   const onDisk = JSON.parse(fs.readFileSync(path.join(h.cwd, file), "utf8"));
-  assert.equal(onDisk.rabbit, "0.2.3");
+  assert.equal(onDisk.rabbit, "0.3.0");
   assert.equal(onDisk.eventCount, 200, "in-memory ring is capped at 200 events");
   assert.equal(onDisk.events.length, 200);
   assert.ok(onDisk.events.every((e) => e.kind && e.detail && e.seq > 0));

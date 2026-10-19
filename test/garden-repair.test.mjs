@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createRabbitExtension, RECEIPT_ENTRY } from "../dist/index.js";
 
 const GARDEN_STATE = "rabbit-pi-compactor-state-v1";
 const GARDEN_RECEIPT = "rabbit-pi-compactor-garden-receipt-v1";
 
 function harness(initialTokens = 300_000, contextWindow = 1_000_000) {
+  // Isolate the durable file config per harness: never touch the real user config.
+  process.env.RABBIT_CONFIG_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rabbit-test-")), "rabbit.json");
   const handlers = new Map();
   const commands = new Map();
   const tools = new Map();
